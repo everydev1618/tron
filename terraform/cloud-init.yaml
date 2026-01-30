@@ -1,0 +1,136 @@
+#cloud-config
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - docker.io
+  - docker-compose-plugin
+  - jq
+  - awscli
+  - debian-keyring
+  - debian-archive-keyring
+  - apt-transport-https
+  - curl
+
+write_files:
+  # Tron systemd service
+  - path: /etc/systemd/system/tron.service
+    content: |
+      [Unit]
+      Description=Tron AI Multi-Agent System (${instance_name})
+      After=network.target docker.service
+      Requires=docker.service
+
+      [Service]
+      Type=simple
+      User=ubuntu
+      WorkingDirectory=/opt/tron
+      ExecStart=/opt/tron/start.sh
+      Restart=always
+      RestartSec=5
+      Environment=HOME=/home/ubuntu
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # Startup script that loads secrets from AWS Secrets Manager
+  - path: /opt/tron/start.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -e
+
+      cd /opt/tron
+
+      # Load secrets from AWS Secrets Manager
+      echo "Loading secrets from AWS Secrets Manager (${secrets_manager_secret_name})..."
+      eval $(aws secretsmanager get-secret-value \
+        --secret-id "${secrets_manager_secret_name}" \
+        --region ${aws_region} \
+        --query SecretString \
+        --output text | jq -r 'to_entries|.[]|"export \(.key)=\(.value)"')
+
+      # Start tron
+      exec ./tron serve --port 3000
+
+  # Caddy configuration
+  - path: /etc/caddy/Caddyfile
+    content: |
+      ${fqdn} {
+        reverse_proxy localhost:3000
+
+        # Log access
+        log {
+          output file /var/log/caddy/access.log
+          format json
+        }
+      }
+
+  # Environment file template (secrets loaded from AWS Secrets Manager at startup)
+  - path: /opt/tron/.env
+    content: |
+      # Non-secret configuration
+      # Secrets (ANTHROPIC_API_KEY, etc.) are loaded from
+      # AWS Secrets Manager (${secrets_manager_secret_name}) at startup via start.sh
+      TRON_INSTANCE=${instance_name}
+    permissions: '0600'
+
+  # Bootstrap script
+  - path: /opt/tron/bootstrap.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -e
+
+      INSTANCE="${instance_name}"
+      S3_BUCKET="${s3_bucket}"
+      AWS_REGION="${aws_region}"
+
+      cd /opt/tron
+
+      echo "==> Downloading tron binary from S3..."
+      aws s3 cp "s3://$S3_BUCKET/binaries/tron-linux-amd64" ./tron --region "$AWS_REGION"
+      chmod +x ./tron
+
+      echo "==> Downloading config files from S3..."
+      aws s3 cp "s3://$S3_BUCKET/config/tron.vega.yaml" ./tron.vega.yaml --region "$AWS_REGION" || true
+      aws s3 sync "s3://$S3_BUCKET/config/knowledge/" ./knowledge/ --region "$AWS_REGION" || true
+
+      echo "==> Setting permissions..."
+      chown -R ubuntu:ubuntu /opt/tron
+
+      echo "==> Bootstrap complete!"
+
+runcmd:
+  # Add ubuntu user to docker group
+  - usermod -aG docker ubuntu
+
+  # Install Caddy first (before creating log dir, so caddy user exists)
+  - curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  - curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' > /etc/apt/sources.list.d/caddy-stable.list
+  - apt-get update
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::="--force-confold" caddy
+
+  # Create log directory for Caddy (after caddy user exists)
+  - mkdir -p /var/log/caddy
+  - chown caddy:caddy /var/log/caddy
+
+  # Create tron directory and set ownership
+  - mkdir -p /opt/tron
+  - mkdir -p /opt/tron/work
+  - mkdir -p /opt/tron/knowledge
+  - chown -R ubuntu:ubuntu /opt/tron
+
+  # Run bootstrap script as ubuntu user
+  - su - ubuntu -c '/opt/tron/bootstrap.sh'
+
+  # Enable and start services
+  - systemctl daemon-reload
+  - systemctl enable tron
+  - systemctl enable caddy
+  - systemctl start caddy
+  - systemctl start tron
+
+  # Log completion
+  - echo "Tron ${instance_name} deployment complete at $(date)" >> /var/log/tron-deploy.log

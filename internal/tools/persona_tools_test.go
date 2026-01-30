@@ -87,7 +87,7 @@ func TestNewPersonaTools(t *testing.T) {
 	defer orch.Shutdown(context.Background())
 
 	config := createTestConfig()
-	pt := NewPersonaTools(orch, config, "./work", ".")
+	pt := NewPersonaTools(orch, config, "./work", ".", nil)
 
 	if pt == nil {
 		t.Fatal("NewPersonaTools returned nil")
@@ -112,7 +112,7 @@ func TestRegisterTo(t *testing.T) {
 	defer orch.Shutdown(context.Background())
 
 	config := createTestConfig()
-	pt := NewPersonaTools(orch, config, "./work", ".")
+	pt := NewPersonaTools(orch, config, "./work", ".", nil)
 
 	tools := vega.NewTools()
 	pt.RegisterTo(tools)
@@ -147,7 +147,7 @@ func TestCreateProject(t *testing.T) {
 	defer orch.Shutdown(context.Background())
 
 	config := createTestConfig()
-	pt := NewPersonaTools(orch, config, "./work", ".")
+	pt := NewPersonaTools(orch, config, "./work", ".", nil)
 
 	// Create temp directory for test
 	tmpDir := t.TempDir()
@@ -262,7 +262,7 @@ func TestIdentifyCaller(t *testing.T) {
 	defer orch.Shutdown(context.Background())
 
 	config := createTestConfig()
-	pt := NewPersonaTools(orch, config, "./work", ".")
+	pt := NewPersonaTools(orch, config, "./work", ".", nil)
 
 	// Add a test contact
 	pt.contacts.mu.Lock()
@@ -326,7 +326,7 @@ func TestSaveDirective(t *testing.T) {
 	defer orch.Shutdown(context.Background())
 
 	config := createTestConfig()
-	pt := NewPersonaTools(orch, config, "./work", ".")
+	pt := NewPersonaTools(orch, config, "./work", ".", nil)
 
 	// Create temp directory for test
 	tmpDir := t.TempDir()
@@ -370,7 +370,7 @@ func TestSavePersonMemory(t *testing.T) {
 	defer orch.Shutdown(context.Background())
 
 	config := createTestConfig()
-	pt := NewPersonaTools(orch, config, "./work", ".")
+	pt := NewPersonaTools(orch, config, "./work", ".", nil)
 
 	// Create temp directory for test
 	tmpDir := t.TempDir()

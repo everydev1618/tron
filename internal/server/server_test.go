@@ -87,7 +87,7 @@ func setupTestServer(t *testing.T) (*Server, *mockLLM) {
 	})
 
 	config := createTestConfig()
-	customTools := tools.NewPersonaTools(orch, config, "./work", ".")
+	customTools := tools.NewPersonaTools(orch, config, "./work", ".", nil)
 	srv := New(orch, config, customTools, 0, "./work")
 
 	return srv, llm

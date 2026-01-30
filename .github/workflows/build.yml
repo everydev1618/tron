@@ -1,0 +1,233 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      deploy_instance:
+        description: 'Deploy to specific instance only (leave empty for all)'
+        required: false
+        type: string
+      skip_deploy:
+        description: 'Skip deployment (build and upload only)'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  GO_VERSION: '1.22'
+  S3_BUCKET: hellotron-vega-deploy
+  AWS_REGION: us-east-1
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      binary_uploaded: ${{ steps.upload.outputs.uploaded }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Build binary
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o tron-linux-amd64 ./cmd/tron
+          chmod +x tron-linux-amd64
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload binary to S3
+        id: upload
+        run: |
+          aws s3 cp tron-linux-amd64 s3://${{ env.S3_BUCKET }}/binaries/tron-linux-amd64
+          echo "Binary uploaded to s3://${{ env.S3_BUCKET }}/binaries/tron-linux-amd64"
+          echo "uploaded=true" >> $GITHUB_OUTPUT
+
+      - name: Upload config files to S3
+        run: |
+          # Upload main config
+          if [ -f "tron.vega.yaml" ]; then
+            aws s3 cp tron.vega.yaml s3://${{ env.S3_BUCKET }}/config/tron.vega.yaml
+          fi
+          # Sync knowledge directory
+          if [ -d "knowledge" ]; then
+            aws s3 sync knowledge/ s3://${{ env.S3_BUCKET }}/config/knowledge/ --delete
+          fi
+          echo "Config files uploaded to S3"
+
+      - name: Upload versioned binary (on tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          aws s3 cp tron-linux-amd64 s3://${{ env.S3_BUCKET }}/binaries/tron-linux-amd64-${VERSION}
+          echo "Versioned binary uploaded: tron-linux-amd64-${VERSION}"
+
+  deploy:
+    needs: build
+    if: ${{ !inputs.skip_deploy }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      - name: Download binary from S3
+        run: |
+          aws s3 cp s3://${{ env.S3_BUCKET }}/binaries/tron-linux-amd64 ./tron-linux-amd64
+          chmod +x ./tron-linux-amd64
+
+      - name: Download config files from S3
+        run: |
+          aws s3 cp s3://${{ env.S3_BUCKET }}/config/tron.vega.yaml ./tron.vega.yaml || true
+          aws s3 sync s3://${{ env.S3_BUCKET }}/config/knowledge/ ./knowledge/ || true
+          echo "Config files downloaded"
+
+      - name: Get target instances
+        id: instances
+        env:
+          DEPLOY_INSTANCE: ${{ inputs.deploy_instance }}
+        run: |
+          if [ -n "$DEPLOY_INSTANCE" ]; then
+            # Deploy to specific instance
+            FILTER="Name=tag:Instance,Values=${DEPLOY_INSTANCE}"
+          else
+            # Deploy to all hellotron-vega instances
+            FILTER="Name=tag:Project,Values=hellotron-vega"
+          fi
+
+          # Get all running instances with their IPs and names
+          INSTANCES=$(aws ec2 describe-instances \
+            --filters "$FILTER" "Name=instance-state-name,Values=running" \
+            --query 'Reservations[].Instances[].[PublicIpAddress,Tags[?Key==`Instance`].Value|[0]]' \
+            --output text)
+
+          if [ -z "$INSTANCES" ]; then
+            echo "No running instances found"
+            echo "instance_count=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Found instances:"
+          echo "$INSTANCES"
+
+          # Save to file for next step
+          echo "$INSTANCES" > /tmp/instances.txt
+          INSTANCE_COUNT=$(echo "$INSTANCES" | wc -l | tr -d ' ')
+          echo "instance_count=$INSTANCE_COUNT" >> $GITHUB_OUTPUT
+
+      - name: Deploy to instances
+        if: steps.instances.outputs.instance_count != '0'
+        run: |
+          echo "Deploying to instances..."
+
+          while IFS=$'\t' read -r IP INSTANCE; do
+            if [ -z "$IP" ] || [ "$IP" == "None" ]; then
+              continue
+            fi
+
+            echo ""
+            echo "=========================================="
+            echo "Deploying to $INSTANCE ($IP)"
+            echo "=========================================="
+
+            # Copy binary to instance
+            scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i ~/.ssh/deploy_key \
+              ./tron-linux-amd64 ubuntu@${IP}:/tmp/tron-new
+
+            # Copy config files to instance
+            if [ -f "tron.vega.yaml" ]; then
+              scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i ~/.ssh/deploy_key \
+                ./tron.vega.yaml ubuntu@${IP}:/tmp/
+            fi
+            if [ -d "knowledge" ]; then
+              scp -r -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i ~/.ssh/deploy_key \
+                ./knowledge ubuntu@${IP}:/tmp/
+            fi
+
+            # Deploy on instance
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i ~/.ssh/deploy_key ubuntu@${IP} << 'DEPLOY_SCRIPT'
+              set -e
+              cd /opt/tron
+
+              echo "Stopping tron service..."
+              sudo systemctl stop tron || true
+
+              echo "Replacing binary..."
+              mv /tmp/tron-new ./tron
+              chmod +x ./tron
+
+              echo "Syncing config files..."
+              [ -f /tmp/tron.vega.yaml ] && mv /tmp/tron.vega.yaml ./
+              [ -d /tmp/knowledge ] && rsync -a /tmp/knowledge/ ./knowledge/ && rm -rf /tmp/knowledge
+
+              echo "Starting tron service..."
+              sudo systemctl start tron
+
+              echo "Verifying service is running..."
+              sleep 3
+              if systemctl is-active --quiet tron; then
+                echo "Tron service running"
+              else
+                echo "Service failed to start!"
+                journalctl -u tron -n 20 --no-pager
+                exit 1
+              fi
+
+              echo "Testing health endpoint..."
+              HEALTH=$(curl -sf http://localhost:3000/health)
+              if [ $? -eq 0 ]; then
+                echo "Health check passed: $HEALTH"
+              else
+                echo "Health check failed!"
+                exit 1
+              fi
+
+              echo "Testing Docker..."
+              if ! docker info > /dev/null 2>&1; then
+                echo "Docker daemon not running!"
+                exit 1
+              fi
+
+              # Run a simple container test
+              if docker run --rm alpine:latest echo "DOCKER_OK" 2>&1 | grep -q "DOCKER_OK"; then
+                echo "Docker smoke test passed"
+              else
+                echo "Docker smoke test failed"
+                exit 1
+              fi
+
+              echo "All tests passed!"
+          DEPLOY_SCRIPT
+
+            if [ $? -eq 0 ]; then
+              echo "$INSTANCE deployed successfully"
+            else
+              echo "$INSTANCE deploy failed"
+            fi
+
+          done < /tmp/instances.txt
+
+          echo ""
+          echo "=========================================="
+          echo "Deployment complete!"
+          echo "=========================================="

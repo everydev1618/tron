@@ -5,13 +5,16 @@ import (
 	"fmt"
 	"net/smtp"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/martellcode/tron/internal/subdomain"
 	"github.com/vegaops/vega"
+	"github.com/vegaops/vega/container"
 	"github.com/vegaops/vega/dsl"
 	"gopkg.in/yaml.v3"
 )
@@ -23,6 +26,13 @@ type PersonaTools struct {
 	contacts   *ContactDB
 	workingDir string
 	tronDir    string
+
+	// Container management
+	containers *container.Manager
+	projects   *container.ProjectRegistry
+
+	// Server process management (for *.hellotron.com routing)
+	processManager *subdomain.ProcessManager
 
 	// Track spawned agents and their callbacks
 	callbacks   map[string]CallbackConfig
@@ -61,16 +71,25 @@ type Contact struct {
 }
 
 // NewPersonaTools creates a new PersonaTools instance
-func NewPersonaTools(orch *vega.Orchestrator, config *dsl.Document, workingDir, tronDir string) *PersonaTools {
+func NewPersonaTools(orch *vega.Orchestrator, config *dsl.Document, workingDir, tronDir string, cm *container.Manager) *PersonaTools {
 	pt := &PersonaTools{
 		orch:         orch,
 		config:       config,
 		contacts:     &ContactDB{contacts: make(map[string]Contact)},
 		workingDir:   workingDir,
 		tronDir:      tronDir,
+		containers:   cm,
 		callbacks:    make(map[string]CallbackConfig),
 		directives:   make(map[string]string),
 		personMemory: make(map[string]map[string]string),
+	}
+
+	// Create project registry if container manager is available
+	if cm != nil {
+		registry, err := container.NewProjectRegistry(workingDir, cm)
+		if err == nil {
+			pt.projects = registry
+		}
 	}
 
 	// Load contacts from knowledge directory (check tron dir first, then current dir)
@@ -81,6 +100,11 @@ func NewPersonaTools(orch *vega.Orchestrator, config *dsl.Document, workingDir, 
 	}
 
 	return pt
+}
+
+// SetProcessManager sets the server process manager for subdomain routing
+func (pt *PersonaTools) SetProcessManager(pm *subdomain.ProcessManager) {
+	pt.processManager = pm
 }
 
 // loadContacts loads contacts from a YAML file
@@ -256,6 +280,92 @@ func (pt *PersonaTools) RegisterTo(tools *vega.Tools) {
 				Required:    true,
 			},
 		},
+	})
+
+	// execute - Run shell commands (in container if available)
+	execDesc := "Execute a shell command in the working directory"
+	if pt.containers != nil && pt.containers.IsAvailable() {
+		execDesc = "Execute a shell command. If a project is specified, runs inside the project's Docker container"
+	}
+	tools.Register("execute", vega.ToolDef{
+		Description: execDesc,
+		Fn:          pt.execute,
+		Params: map[string]vega.ParamDef{
+			"command": {
+				Type:        "string",
+				Description: "The shell command to execute",
+				Required:    true,
+			},
+			"project": {
+				Type:        "string",
+				Description: "Project name to execute in (uses container if available)",
+				Required:    false,
+			},
+		},
+	})
+
+	// get_project_status - Check container status for a project
+	tools.Register("get_project_status", vega.ToolDef{
+		Description: "Get the status of a project's container (running, stopped, etc.)",
+		Fn:          pt.getProjectStatus,
+		Params: map[string]vega.ParamDef{
+			"project": {
+				Type:        "string",
+				Description: "Project name to check",
+				Required:    true,
+			},
+		},
+	})
+
+	// start_server - Start a server process for a project and get its public URL
+	tools.Register("start_server", vega.ToolDef{
+		Description: "Start a server process for a project. Returns a unique public URL (https://xxxx.hellotron.com) that routes to the server.",
+		Fn:          pt.startServer,
+		Params: map[string]vega.ParamDef{
+			"project": {
+				Type:        "string",
+				Description: "Project name (must exist)",
+				Required:    true,
+			},
+			"command": {
+				Type:        "string",
+				Description: "Command to start the server (will receive PORT env variable)",
+				Required:    true,
+			},
+		},
+	})
+
+	// stop_server - Stop a running server
+	tools.Register("stop_server", vega.ToolDef{
+		Description: "Stop a running server for a project",
+		Fn:          pt.stopServer,
+		Params: map[string]vega.ParamDef{
+			"project": {
+				Type:        "string",
+				Description: "Project name",
+				Required:    true,
+			},
+		},
+	})
+
+	// get_server_url - Get the URL of a running server
+	tools.Register("get_server_url", vega.ToolDef{
+		Description: "Get the public URL of a running server for a project",
+		Fn:          pt.getServerURL,
+		Params: map[string]vega.ParamDef{
+			"project": {
+				Type:        "string",
+				Description: "Project name",
+				Required:    true,
+			},
+		},
+	})
+
+	// list_servers - List all running servers
+	tools.Register("list_servers", vega.ToolDef{
+		Description: "List all running project servers with their URLs",
+		Fn:          pt.listServers,
+		Params:      map[string]vega.ParamDef{},
 	})
 }
 
@@ -503,11 +613,23 @@ func (pt *PersonaTools) createProject(ctx context.Context, params map[string]any
 		return '-'
 	}, name)
 
-	projectDir := filepath.Join(pt.workingDir, "projects", safeName)
+	var projectDir string
+	var containerStatus string
 
-	// Create directory
-	if err := os.MkdirAll(projectDir, 0755); err != nil {
-		return "", fmt.Errorf("failed to create project directory: %w", err)
+	// Use project registry if available (creates container)
+	if pt.projects != nil {
+		project, err := pt.projects.GetOrCreateProject(ctx, safeName, description, "")
+		if err != nil {
+			return "", fmt.Errorf("failed to create project: %w", err)
+		}
+		projectDir = pt.projects.GetProjectPath(safeName)
+		containerStatus = fmt.Sprintf("\nContainer status: %s", project.Status)
+	} else {
+		// Fallback to simple directory creation
+		projectDir = filepath.Join(pt.workingDir, "projects", safeName)
+		if err := os.MkdirAll(projectDir, 0755); err != nil {
+			return "", fmt.Errorf("failed to create project directory: %w", err)
+		}
 	}
 
 	// Create README
@@ -523,7 +645,7 @@ func (pt *PersonaTools) createProject(ctx context.Context, params map[string]any
 		}
 	}
 
-	return fmt.Sprintf("Created project '%s' at %s", name, projectDir), nil
+	return fmt.Sprintf("Created project '%s' at %s%s", name, projectDir, containerStatus), nil
 }
 
 // applyTemplate applies a project template
@@ -652,4 +774,265 @@ func (pt *PersonaTools) webSearch(ctx context.Context, params map[string]any) (s
 
 	// TODO: Implement actual search API call
 	return fmt.Sprintf("Searched for: %s (implement actual search API)", query), nil
+}
+
+// execute runs a shell command, optionally in a project's container
+func (pt *PersonaTools) execute(ctx context.Context, params map[string]any) (string, error) {
+	command, _ := params["command"].(string)
+	project, _ := params["project"].(string)
+
+	if command == "" {
+		return "", fmt.Errorf("command is required")
+	}
+
+	// Security: block dangerous commands
+	blockedPatterns := []string{
+		"rm -rf /",
+		"rm -rf /*",
+		"sudo",
+		"su ",
+		".ssh",
+		".aws",
+		"/etc/passwd",
+		"curl.*metadata",
+		"> /dev",
+		"mkfs",
+		"dd if=",
+	}
+	lowerCmd := strings.ToLower(command)
+	for _, pattern := range blockedPatterns {
+		if strings.Contains(lowerCmd, pattern) {
+			return "", fmt.Errorf("blocked command: contains dangerous pattern %q", pattern)
+		}
+	}
+
+	// If project specified and containers available, run in container
+	if project != "" && pt.containers != nil && pt.containers.IsAvailable() {
+		return pt.executeInContainer(ctx, project, command)
+	}
+
+	// Otherwise run on host
+	return pt.executeOnHost(ctx, command, project)
+}
+
+// executeInContainer runs a command inside a project's Docker container
+func (pt *PersonaTools) executeInContainer(ctx context.Context, project, command string) (string, error) {
+	execCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+
+	result, err := pt.containers.Exec(execCtx, project, []string{"bash", "-c", command}, "/workspace")
+	if err != nil {
+		return "", fmt.Errorf("container exec failed: %w", err)
+	}
+
+	var output strings.Builder
+	if result.Stdout != "" {
+		output.WriteString(result.Stdout)
+	}
+	if result.Stderr != "" {
+		if output.Len() > 0 {
+			output.WriteString("\n")
+		}
+		output.WriteString("stderr: ")
+		output.WriteString(result.Stderr)
+	}
+
+	outputStr := output.String()
+	if len(outputStr) > 50000 {
+		outputStr = outputStr[:50000] + "\n... (truncated)"
+	}
+
+	if result.ExitCode != 0 {
+		if outputStr == "" {
+			return "", fmt.Errorf("command failed with exit code %d", result.ExitCode)
+		}
+		return outputStr + fmt.Sprintf("\n\nExit code: %d", result.ExitCode), nil
+	}
+
+	if outputStr == "" {
+		return "(no output)", nil
+	}
+	return outputStr, nil
+}
+
+// executeOnHost runs a command on the host
+func (pt *PersonaTools) executeOnHost(ctx context.Context, command, project string) (string, error) {
+	// Determine working directory
+	workDir := pt.workingDir
+	if project != "" {
+		workDir = filepath.Join(pt.workingDir, "vega.work", "projects", project)
+		if _, err := os.Stat(workDir); os.IsNotExist(err) {
+			// Try without vega.work prefix
+			workDir = filepath.Join(pt.workingDir, "projects", project)
+		}
+	}
+
+	// Ensure working directory exists
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create working directory: %w", err)
+	}
+
+	execCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(execCtx, "bash", "-c", command)
+	cmd.Dir = workDir
+
+	output, err := cmd.CombinedOutput()
+	outputStr := string(output)
+
+	if len(outputStr) > 50000 {
+		outputStr = outputStr[:50000] + "\n... (truncated)"
+	}
+
+	if err != nil {
+		if execCtx.Err() != nil {
+			return "", fmt.Errorf("command timed out after 120 seconds")
+		}
+		if outputStr == "" {
+			return "", fmt.Errorf("command failed: %v", err)
+		}
+		return outputStr + fmt.Sprintf("\n\nError: %v", err), nil
+	}
+
+	if outputStr == "" {
+		return "(no output)", nil
+	}
+	return outputStr, nil
+}
+
+// getProjectStatus returns the status of a project's container
+func (pt *PersonaTools) getProjectStatus(ctx context.Context, params map[string]any) (string, error) {
+	project, _ := params["project"].(string)
+
+	if project == "" {
+		return "", fmt.Errorf("project name is required")
+	}
+
+	if pt.containers == nil || !pt.containers.IsAvailable() {
+		return "Docker not available - projects run in direct mode", nil
+	}
+
+	status, err := pt.containers.GetProjectStatus(ctx, project)
+	if err != nil {
+		return "", fmt.Errorf("failed to get project status: %w", err)
+	}
+
+	var result strings.Builder
+	result.WriteString(fmt.Sprintf("Project: %s\n", project))
+	if status.ContainerID != "" {
+		result.WriteString(fmt.Sprintf("Container ID: %s\n", status.ContainerID))
+	}
+	result.WriteString(fmt.Sprintf("Running: %v\n", status.Running))
+	if status.Image != "" {
+		result.WriteString(fmt.Sprintf("Image: %s\n", status.Image))
+	}
+	if !status.Created.IsZero() {
+		result.WriteString(fmt.Sprintf("Created: %s\n", status.Created.Format(time.RFC3339)))
+	}
+
+	return result.String(), nil
+}
+
+// startServer starts a server process for a project
+func (pt *PersonaTools) startServer(ctx context.Context, params map[string]any) (string, error) {
+	project, _ := params["project"].(string)
+	command, _ := params["command"].(string)
+
+	if project == "" {
+		return "", fmt.Errorf("project name is required")
+	}
+	if command == "" {
+		return "", fmt.Errorf("command is required")
+	}
+
+	if pt.processManager == nil {
+		return "", fmt.Errorf("server management not available")
+	}
+
+	// Determine working directory for the project
+	workDir := filepath.Join(pt.workingDir, "vega.work", "projects", project)
+	if _, err := os.Stat(workDir); os.IsNotExist(err) {
+		workDir = filepath.Join(pt.workingDir, "projects", project)
+		if _, err := os.Stat(workDir); os.IsNotExist(err) {
+			return "", fmt.Errorf("project %q not found", project)
+		}
+	}
+
+	// Prepare environment
+	env := os.Environ()
+
+	// Start the server process
+	proc, err := pt.processManager.StartServer(ctx, project, command, workDir, env)
+	if err != nil {
+		return "", fmt.Errorf("failed to start server: %w", err)
+	}
+
+	return fmt.Sprintf("Server started for project '%s'\nURL: %s\nPort: %d\nSubdomain: %s",
+		project, proc.URL, proc.Port, proc.Subdomain), nil
+}
+
+// stopServer stops a running server
+func (pt *PersonaTools) stopServer(ctx context.Context, params map[string]any) (string, error) {
+	project, _ := params["project"].(string)
+
+	if project == "" {
+		return "", fmt.Errorf("project name is required")
+	}
+
+	if pt.processManager == nil {
+		return "", fmt.Errorf("server management not available")
+	}
+
+	if err := pt.processManager.StopServer(project); err != nil {
+		return "", err
+	}
+
+	return fmt.Sprintf("Server stopped for project '%s'", project), nil
+}
+
+// getServerURL gets the URL of a running server
+func (pt *PersonaTools) getServerURL(ctx context.Context, params map[string]any) (string, error) {
+	project, _ := params["project"].(string)
+
+	if project == "" {
+		return "", fmt.Errorf("project name is required")
+	}
+
+	if pt.processManager == nil {
+		return "", fmt.Errorf("server management not available")
+	}
+
+	proc := pt.processManager.GetServer(project)
+	if proc == nil {
+		return "", fmt.Errorf("no server running for project %q", project)
+	}
+
+	return fmt.Sprintf("URL: %s\nStatus: %s\nPort: %d",
+		proc.URL, proc.Status, proc.Port), nil
+}
+
+// listServers lists all running servers
+func (pt *PersonaTools) listServers(ctx context.Context, params map[string]any) (string, error) {
+	if pt.processManager == nil {
+		return "", fmt.Errorf("server management not available")
+	}
+
+	servers := pt.processManager.ListServers()
+	if len(servers) == 0 {
+		return "No servers currently running", nil
+	}
+
+	var result strings.Builder
+	result.WriteString(fmt.Sprintf("Running servers (%d):\n\n", len(servers)))
+
+	for _, s := range servers {
+		result.WriteString(fmt.Sprintf("Project: %s\n", s.ProjectName))
+		result.WriteString(fmt.Sprintf("  URL: %s\n", s.URL))
+		result.WriteString(fmt.Sprintf("  Port: %d\n", s.Port))
+		result.WriteString(fmt.Sprintf("  Status: %s\n", s.Status))
+		result.WriteString(fmt.Sprintf("  Started: %s\n\n", s.StartedAt.Format(time.RFC3339)))
+	}
+
+	return result.String(), nil
 }

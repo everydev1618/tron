@@ -1,0 +1,30 @@
+# Copy this file to terraform.tfvars and fill in your values
+# terraform.tfvars is gitignored
+
+# AWS Configuration
+aws_region    = "us-east-1"
+instance_type = "t3.medium"
+
+# Name of your EC2 key pair (must exist in AWS)
+key_name = "your-key-pair-name"
+
+# Your IP address(es) for SSH access
+# Find your IP: curl -s ifconfig.me
+admin_cidr_blocks = [
+  "YOUR_IP/32",  # e.g., "203.0.113.50/32"
+]
+
+# Instance Configuration
+# This is used for resource naming (e.g., prod, staging)
+instance_name = "prod"
+
+# Domain Configuration
+domain           = "hellotron.com"
+subdomain_prefix = "api"            # Results in api.hellotron.com
+route53_zone_id  = "ZXXXXXXXXXXXXX" # Your Route53 hosted zone ID
+
+# S3 Bucket for deployment artifacts
+s3_bucket = "hellotron-vega-deploy"
+
+# Secrets Manager secret name
+secrets_manager_secret_name = "hellotron-vega/prod"

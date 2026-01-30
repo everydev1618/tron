@@ -11,7 +11,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/martellcode/tron/internal/callback"
+	"github.com/martellcode/tron/internal/slack"
+	"github.com/martellcode/tron/internal/subdomain"
 	"github.com/martellcode/tron/internal/tools"
+	"github.com/martellcode/tron/internal/voice/elevenlabs"
 	"github.com/vegaops/vega"
 	"github.com/vegaops/vega/dsl"
 )
@@ -23,37 +27,112 @@ type Server struct {
 	customTools *tools.PersonaTools
 	port        int
 	workingDir  string
+	baseDir     string
 	httpServer  *http.Server
 
 	// Session management - maps caller ID to their Tony process
 	sessions   map[string]*vega.Process
 	sessionsMu sync.RWMutex
+
+	// VAPI state for debouncing and call tracking
+	vapiState *vapiState
+
+	// ElevenLabs client for voice
+	elevenLabsClient *elevenlabs.Client
+
+	// Slack handler
+	slackHandler *slack.Handler
+
+	// Callback registry
+	callbackRegistry *callback.Registry
+
+	// Subdomain routing for project servers
+	subdomainRegistry *subdomain.Registry
+	processManager    *subdomain.ProcessManager
 }
 
 // New creates a new server instance
 func New(orch *vega.Orchestrator, config *dsl.Document, customTools *tools.PersonaTools, port int, workingDir string) *Server {
+	// Initialize subdomain routing
+	subdomainReg := subdomain.NewRegistry()
+	procManager := subdomain.NewProcessManager(subdomainReg)
+
 	s := &Server{
-		orch:        orch,
-		config:      config,
-		customTools: customTools,
-		port:        port,
-		workingDir:  workingDir,
-		sessions:    make(map[string]*vega.Process),
+		orch:              orch,
+		config:            config,
+		customTools:       customTools,
+		port:              port,
+		workingDir:        workingDir,
+		baseDir:           ".", // Default to current directory
+		sessions:          make(map[string]*vega.Process),
+		vapiState:         newVAPIState(),
+		subdomainRegistry: subdomainReg,
+		processManager:    procManager,
 	}
 
 	mux := http.NewServeMux()
+
+	// Chat completion endpoints (VAPI compatible)
 	mux.HandleFunc("/chat/completions", s.handleChatCompletions)
-	mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions) // OpenAI-compatible path
+	mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions)
+
+	// VAPI events webhook
+	mux.HandleFunc("/vapi/events", s.handleVAPIEvents)
+
+	// ElevenLabs endpoints
+	mux.HandleFunc("/ws/elevenlabs", s.handleElevenLabsWS)
+	mux.HandleFunc("/v1/elevenlabs-llm", s.handleElevenLabsLLM)
+
+	// Slack events webhook (registered if handler is set)
+	mux.HandleFunc("/slack/events", s.handleSlackEvents)
+
+	// Caddy on-demand TLS verification endpoint
+	mux.HandleFunc("/internal/caddy-ask", s.subdomainRegistry.HandleCaddyAsk)
+
+	// Health check
 	mux.HandleFunc("/health", s.handleHealth)
+
+	// Wrap with subdomain routing middleware
+	handler := s.subdomainRegistry.Middleware(mux)
 
 	s.httpServer = &http.Server{
 		Addr:         fmt.Sprintf(":%d", port),
-		Handler:      mux,
+		Handler:      handler,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 5 * time.Minute, // Long timeout for streaming
 	}
 
 	return s
+}
+
+// SetBaseDir sets the base directory for memory and config files
+func (s *Server) SetBaseDir(dir string) {
+	s.baseDir = dir
+}
+
+// SetElevenLabsClient sets the ElevenLabs client
+func (s *Server) SetElevenLabsClient(client *elevenlabs.Client) {
+	s.elevenLabsClient = client
+}
+
+// SetSlackHandler sets the Slack event handler
+func (s *Server) SetSlackHandler(handler *slack.Handler) {
+	s.slackHandler = handler
+}
+
+// SetCallbackRegistry sets the callback registry
+func (s *Server) SetCallbackRegistry(registry *callback.Registry) {
+	s.callbackRegistry = registry
+}
+
+// GetProcessManager returns the process manager for starting project servers
+func (s *Server) GetProcessManager() *subdomain.ProcessManager {
+	return s.processManager
+}
+
+// GetSubdomainRegistry returns the subdomain registry
+func (s *Server) GetSubdomainRegistry() *subdomain.Registry {
+	return s.subdomainRegistry
 }
 
 // ListenAndServe starts the HTTP server
@@ -63,7 +142,22 @@ func (s *Server) ListenAndServe() error {
 
 // Shutdown gracefully shuts down the server
 func (s *Server) Shutdown(ctx context.Context) error {
+	if s.slackHandler != nil {
+		s.slackHandler.Shutdown()
+	}
+	if s.processManager != nil {
+		s.processManager.Shutdown()
+	}
 	return s.httpServer.Shutdown(ctx)
+}
+
+// handleSlackEvents delegates to the Slack handler if configured
+func (s *Server) handleSlackEvents(w http.ResponseWriter, r *http.Request) {
+	if s.slackHandler == nil {
+		http.Error(w, "Slack not configured", http.StatusServiceUnavailable)
+		return
+	}
+	s.slackHandler.HandleEvents(w, r)
 }
 
 // OpenAI-compatible request/response structures
@@ -133,6 +227,13 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// Extract caller info from VAPI headers
 	callerPhone := r.Header.Get("X-Vapi-Caller-Phone")
+	callID := r.Header.Get("X-Vapi-Call-ID")
+
+	// Try to get phone from VAPI cache if not in header
+	if callerPhone == "" && callID != "" {
+		callerPhone, _ = s.getCallerFromVAPI(callID)
+	}
+
 	callerID := callerPhone
 	if callerID == "" {
 		callerID = r.Header.Get("X-Request-ID")
@@ -392,6 +493,9 @@ func (s *Server) CleanupStaleSessions(maxAge time.Duration) {
 		}
 		// Note: Could also check proc.Metrics().LastActivity for age-based cleanup
 	}
+
+	// Also cleanup VAPI cache
+	s.cleanupVAPICache(maxAge)
 }
 
 // Helper to check if a string contains any of the substrings
