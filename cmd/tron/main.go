@@ -192,13 +192,7 @@ func runServe(args []string) {
 		log.Printf("Slack integration enabled")
 	}
 
-	// Initialize Tony's life loop (autonomous daily routine)
-	tonyPersona := life.PersonaConfig{
-		Name:        "Tony",
-		Role:        "CTO",
-		FocusAreas:  []string{"engineering", "AI", "startups", "distributed systems", "team building"},
-		ContentTone: "Technical but accessible, pragmatic, startup-minded",
-	}
+	// Initialize life manager for all C-suite personas
 	lifeConfig := life.DefaultConfig(tronCfg.TronDir)
 	if apiURL := os.Getenv("TRON_SOCIAL_API_URL"); apiURL != "" {
 		lifeConfig.SocialEnabled = true
@@ -208,14 +202,15 @@ func runServe(args []string) {
 	if slackChannel := os.Getenv("TRON_LIFE_SLACK_CHANNEL"); slackChannel != "" {
 		lifeConfig.SlackChannel = slackChannel
 	}
-	tonyLife := life.New(orch, tonyPersona, lifeConfig)
+	lifeManager := life.NewManager(orch, lifeConfig)
+	lifeManager.AddDefaultPersonas()
 	if slackClient != nil && lifeConfig.SlackChannel != "" {
-		tonyLife.SetSlack(slackClient)
-		log.Printf("Tony's life updates will post to Slack channel: %s", lifeConfig.SlackChannel)
+		lifeManager.SetSlack(slackClient)
+		log.Printf("Life updates will post to Slack channel: %s", lifeConfig.SlackChannel)
 	}
-	srv.SetLifeLoop(tonyLife)
-	tonyLife.Start()
-	log.Printf("Tony's life loop started")
+	srv.SetLifeManager(lifeManager)
+	lifeManager.Start()
+	log.Printf("Life manager started for personas: %v", lifeManager.Personas())
 
 	// Graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
@@ -228,7 +223,7 @@ func runServe(args []string) {
 		<-sigCh
 		log.Println("Shutting down...")
 		cancel()
-		tonyLife.Stop()
+		lifeManager.Stop()
 		srv.Shutdown(ctx)
 		orch.Shutdown(ctx)
 	}()

@@ -51,13 +51,15 @@ type Server struct {
 	subdomainRegistry *subdomain.Registry
 	processManager    *subdomain.ProcessManager
 
-	// Life loop for triggering activities
-	lifeLoop LifeLoop
+	// Life manager for triggering activities across personas
+	lifeManager LifeManager
 }
 
-// LifeLoop interface for Tony's autonomous routine (to avoid circular imports)
-type LifeLoop interface {
-	TriggerActivity(activity string) string
+// LifeManager interface for managing multiple persona life loops (to avoid circular imports)
+type LifeManager interface {
+	TriggerActivity(persona, activity string) string
+	TriggerActivityAll(activity string) map[string]string
+	Personas() []string
 }
 
 // New creates a new server instance
@@ -147,9 +149,9 @@ func (s *Server) GetSubdomainRegistry() *subdomain.Registry {
 	return s.subdomainRegistry
 }
 
-// SetLifeLoop sets the life loop for triggering activities
-func (s *Server) SetLifeLoop(loop LifeLoop) {
-	s.lifeLoop = loop
+// SetLifeManager sets the life manager for triggering activities across personas
+func (s *Server) SetLifeManager(manager LifeManager) {
+	s.lifeManager = manager
 }
 
 // ListenAndServe starts the HTTP server
@@ -224,29 +226,47 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLifeTrigger(w http.ResponseWriter, r *http.Request) {
-	if s.lifeLoop == nil {
-		http.Error(w, "Life loop not configured", http.StatusServiceUnavailable)
+	if s.lifeManager == nil {
+		http.Error(w, "Life manager not configured", http.StatusServiceUnavailable)
 		return
 	}
 
 	activity := r.URL.Query().Get("activity")
+	persona := r.URL.Query().Get("persona")
+
 	if activity == "" {
-		// Return list of valid activities
+		// Return list of valid activities and personas
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"error":      "Missing 'activity' query parameter",
 			"activities": []string{"news", "goals", "team_check", "reflection", "journal", "post"},
-			"example":    "/internal/life/trigger?activity=news",
+			"personas":   s.lifeManager.Personas(),
+			"examples": []string{
+				"/internal/life/trigger?activity=post&persona=Tony",
+				"/internal/life/trigger?activity=post (triggers all personas)",
+			},
 		})
 		return
 	}
 
-	result := s.lifeLoop.TriggerActivity(activity)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"activity": activity,
-		"result":   result,
-	})
+
+	if persona != "" {
+		// Trigger for specific persona
+		result := s.lifeManager.TriggerActivity(persona, activity)
+		json.NewEncoder(w).Encode(map[string]string{
+			"persona":  persona,
+			"activity": activity,
+			"result":   result,
+		})
+	} else {
+		// Trigger for all personas
+		results := s.lifeManager.TriggerActivityAll(activity)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"activity": activity,
+			"results":  results,
+		})
+	}
 }
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
