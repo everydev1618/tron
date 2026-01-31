@@ -52,7 +52,7 @@ func NewSocialClient(apiURL, apiKey string) *SocialClient {
 			// Personal
 			"phone", "address", "ssn",
 		},
-		maxPostLen:     144, // Hellotron feed limit
+		maxPostLen:     288, // Hellotron feed limit
 		minTimeBetween: 10 * time.Minute, // Hellotron rate limit
 	}
 }
@@ -109,27 +109,30 @@ func (s *SocialClient) Compose(ctx context.Context, author string, journal []Jou
 	return nil
 }
 
-// composeFromArticle creates a post about an article (max 144 chars).
+// composeFromArticle creates a post about an article with link (max 288 chars).
 func (s *SocialClient) composeFromArticle(article Article) string {
 	topic := extractTopic(article.Title)
 	if topic == "" {
 		return ""
 	}
 
-	// Keep topic short to fit within 144 chars
-	if len(topic) > 40 {
-		topic = topic[:37] + "..."
-	}
-
 	take := generateTake(topic)
-	post := fmt.Sprintf("Reading: %s. %s", topic, take)
 
-	// Ensure we fit in 144 chars
-	if len(post) > 144 {
-		// Try shorter format
-		post = fmt.Sprintf("%s - %s", topic, take)
-		if len(post) > 144 {
-			post = post[:141] + "..."
+	// Include the article URL
+	post := fmt.Sprintf("Reading: %s. %s\n\n%s", topic, take, article.URL)
+
+	// Ensure we fit in 288 chars
+	if len(post) > 288 {
+		// Shorten the topic to make room
+		maxTopicLen := 288 - len(take) - len(article.URL) - 20 // 20 for "Reading: " + ". " + "\n\n"
+		if maxTopicLen > 10 {
+			if len(topic) > maxTopicLen {
+				topic = topic[:maxTopicLen-3] + "..."
+			}
+			post = fmt.Sprintf("Reading: %s. %s\n\n%s", topic, take, article.URL)
+		} else {
+			// Just post the link with minimal text
+			post = fmt.Sprintf("%s\n\n%s", take, article.URL)
 		}
 	}
 
@@ -211,10 +214,10 @@ func (s *SocialClient) Publish(ctx context.Context, post *SocialPost) error {
 		return fmt.Errorf("post failed safety check")
 	}
 
-	// Truncate content to 144 chars if needed
+	// Truncate content to 288 chars if needed
 	content := post.Content
-	if len(content) > 144 {
-		content = content[:141] + "..."
+	if len(content) > 288 {
+		content = content[:285] + "..."
 	}
 
 	// Prepare request - Hellotron feed uses simple {"content": "..."} format
