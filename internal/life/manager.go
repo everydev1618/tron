@@ -1,6 +1,8 @@
 package life
 
 import (
+	"context"
+	"fmt"
 	"log"
 	"sync"
 
@@ -19,35 +21,41 @@ type Manager struct {
 }
 
 // DefaultPersonas returns the default C-suite personas with their configurations.
+// Avatars are DC Comics style portraits generated via DALL-E and stored in S3.
 func DefaultPersonas() []PersonaConfig {
 	return []PersonaConfig{
 		{
 			Name:        "Tony",
 			Role:        "CTO",
+			AvatarUrl:   "https://hellotron-avatars.s3.us-west-2.amazonaws.com/avatars/personas/tony.png",
 			FocusAreas:  []string{"engineering", "technology", "architecture", "ai", "infrastructure"},
 			ContentTone: "Technical and pragmatic, with dry humor",
 		},
 		{
 			Name:        "Maya",
 			Role:        "CMO",
+			AvatarUrl:   "https://hellotron-avatars.s3.us-west-2.amazonaws.com/avatars/personas/maya.png",
 			FocusAreas:  []string{"marketing", "growth", "brand", "customers", "positioning"},
 			ContentTone: "Direct and numbers-focused, asks 'so what?'",
 		},
 		{
 			Name:        "Alex",
 			Role:        "CEO",
+			AvatarUrl:   "https://hellotron-avatars.s3.us-west-2.amazonaws.com/avatars/personas/alex.png",
 			FocusAreas:  []string{"strategy", "leadership", "vision", "culture", "execution"},
 			ContentTone: "Strategic and warm, tells stories to make points",
 		},
 		{
 			Name:        "Jordan",
 			Role:        "CFO",
+			AvatarUrl:   "https://hellotron-avatars.s3.us-west-2.amazonaws.com/avatars/personas/jordan.png",
 			FocusAreas:  []string{"finance", "runway", "unit economics", "fundraising", "budgets"},
 			ContentTone: "Translates finance to plain English, direct about bad news",
 		},
 		{
 			Name:        "Riley",
 			Role:        "CPO",
+			AvatarUrl:   "", // Generate via: cd hellotron && npx tsx scripts/generate-persona-avatars.ts Riley
 			FocusAreas:  []string{"product", "users", "roadmap", "ux", "research"},
 			ContentTone: "User-focused and hypothesis-driven, comfortable saying 'I don't know'",
 		},
@@ -116,6 +124,104 @@ func (m *Manager) AddPersona(persona PersonaConfig, schedule LoopConfig) {
 		loop.SetSlack(m.slack)
 	}
 	m.loops[persona.Name] = loop
+}
+
+// EnsureAvatar checks if a persona has an avatar URL and generates one if missing.
+// The agentID is required to call the hellotron avatar API.
+// Returns the avatar URL (existing or newly generated).
+func (m *Manager) EnsureAvatar(ctx context.Context, personaName, agentID string) (string, error) {
+	m.mu.RLock()
+	loop, ok := m.loops[personaName]
+	m.mu.RUnlock()
+
+	if !ok {
+		return "", fmt.Errorf("unknown persona: %s", personaName)
+	}
+
+	persona := loop.Persona()
+
+	// If already has avatar, return it
+	if persona.AvatarUrl != "" {
+		return persona.AvatarUrl, nil
+	}
+
+	// Generate a new avatar
+	avatarUrl, err := m.social.GenerateAvatar(ctx, persona, agentID)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate avatar for %s: %w", personaName, err)
+	}
+
+	// Update the persona config in the loop
+	m.mu.Lock()
+	if l, exists := m.loops[personaName]; exists {
+		updatedPersona := l.Persona()
+		updatedPersona.AvatarUrl = avatarUrl
+		l.UpdatePersona(updatedPersona)
+	}
+	m.mu.Unlock()
+
+	return avatarUrl, nil
+}
+
+// EnsureAllAvatars generates avatars for all personas that don't have one.
+// agentIDs maps persona name to their hellotron agent ID.
+func (m *Manager) EnsureAllAvatars(ctx context.Context, agentIDs map[string]string) map[string]string {
+	results := make(map[string]string)
+
+	m.mu.RLock()
+	personas := make([]string, 0, len(m.loops))
+	for name := range m.loops {
+		personas = append(personas, name)
+	}
+	m.mu.RUnlock()
+
+	for _, name := range personas {
+		agentID, ok := agentIDs[name]
+		if !ok {
+			log.Printf("[life-manager] No agent ID for persona %s, skipping avatar", name)
+			continue
+		}
+
+		avatarUrl, err := m.EnsureAvatar(ctx, name, agentID)
+		if err != nil {
+			log.Printf("[life-manager] Failed to ensure avatar for %s: %v", name, err)
+			continue
+		}
+		results[name] = avatarUrl
+		log.Printf("[life-manager] Avatar for %s: %s", name, avatarUrl)
+	}
+
+	return results
+}
+
+// SyncAvatars syncs avatar URLs from PersonaConfig to hellotron for all personas.
+// This should be called on startup to ensure hellotron has the correct avatar URLs.
+// agentIDs maps persona name to their hellotron agent ID.
+func (m *Manager) SyncAvatars(ctx context.Context, agentIDs map[string]string) {
+	m.mu.RLock()
+	personas := make([]PersonaConfig, 0, len(m.loops))
+	for _, loop := range m.loops {
+		personas = append(personas, loop.Persona())
+	}
+	m.mu.RUnlock()
+
+	for _, persona := range personas {
+		if persona.AvatarUrl == "" {
+			log.Printf("[life-manager] %s has no avatar URL configured, skipping sync", persona.Name)
+			continue
+		}
+
+		agentID, ok := agentIDs[persona.Name]
+		if !ok {
+			log.Printf("[life-manager] No agent ID for persona %s, skipping avatar sync", persona.Name)
+			continue
+		}
+
+		if err := m.social.SyncAvatar(ctx, persona, agentID); err != nil {
+			log.Printf("[life-manager] Failed to sync avatar for %s: %v", persona.Name, err)
+			continue
+		}
+	}
 }
 
 // AddDefaultPersonas adds all default C-suite personas with staggered schedules.

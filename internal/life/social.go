@@ -245,6 +245,137 @@ func (s *SocialClient) isSafe(content string) bool {
 	return true
 }
 
+// AvatarRequest represents a request to generate a persona avatar.
+type AvatarRequest struct {
+	Style       string   `json:"style"`       // "persona" for DC Comics style
+	Role        string   `json:"role"`        // e.g., "CTO", "CMO"
+	ContentTone string   `json:"contentTone"` // e.g., "Technical and pragmatic"
+	FocusAreas  []string `json:"focusAreas"`  // e.g., ["engineering", "ai"]
+}
+
+// SetAvatarRequest represents a request to set an existing avatar URL.
+type SetAvatarRequest struct {
+	AvatarUrl string `json:"avatarUrl"`
+}
+
+// AvatarResponse represents the response from avatar generation.
+type AvatarResponse struct {
+	AvatarUrl string `json:"avatarUrl"`
+	Error     string `json:"error,omitempty"`
+}
+
+// SyncAvatar syncs a persona's avatar URL to hellotron without regenerating.
+// Use this when the avatar already exists in S3 and just needs to be set in the DB.
+func (s *SocialClient) SyncAvatar(ctx context.Context, persona PersonaConfig, agentID string) error {
+	if s.apiURL == "" {
+		return fmt.Errorf("social API URL not configured")
+	}
+
+	if persona.AvatarUrl == "" {
+		return fmt.Errorf("persona %s has no avatar URL to sync", persona.Name)
+	}
+
+	apiKey := s.getKeyForAgent(persona.Name)
+	if apiKey == "" {
+		return fmt.Errorf("no API key configured for persona %s", persona.Name)
+	}
+
+	req := SetAvatarRequest{AvatarUrl: persona.AvatarUrl}
+	jsonData, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("failed to marshal sync request: %w", err)
+	}
+
+	// Extract base URL and construct avatar endpoint
+	baseURL := strings.TrimSuffix(s.apiURL, "/posts")
+	baseURL = strings.TrimSuffix(baseURL, "/api")
+	avatarURL := fmt.Sprintf("%s/api/agents/%s/avatar", baseURL, agentID)
+
+	httpReq, err := http.NewRequestWithContext(ctx, "PUT", avatarURL, bytes.NewReader(jsonData))
+	if err != nil {
+		return fmt.Errorf("failed to create sync request: %w", err)
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("X-API-Key", apiKey)
+
+	resp, err := s.client.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("failed to sync avatar: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("avatar sync API error: status %d", resp.StatusCode)
+	}
+
+	log.Printf("[social] Synced avatar for %s: %s", persona.Name, persona.AvatarUrl)
+	return nil
+}
+
+// GenerateAvatar generates a DC Comics style avatar for a persona.
+// This calls the hellotron API to generate and store the avatar permanently.
+// Returns the avatar URL on success.
+func (s *SocialClient) GenerateAvatar(ctx context.Context, persona PersonaConfig, agentID string) (string, error) {
+	if s.apiURL == "" {
+		return "", fmt.Errorf("social API URL not configured")
+	}
+
+	apiKey := s.getKeyForAgent(persona.Name)
+	if apiKey == "" {
+		return "", fmt.Errorf("no API key configured for persona %s", persona.Name)
+	}
+
+	// Build the avatar generation request
+	req := AvatarRequest{
+		Style:       "persona",
+		Role:        persona.Role,
+		ContentTone: persona.ContentTone,
+		FocusAreas:  persona.FocusAreas,
+	}
+
+	jsonData, err := json.Marshal(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal avatar request: %w", err)
+	}
+
+	// Extract base URL and construct avatar endpoint
+	// s.apiURL is like "https://hellotron.com/api/posts"
+	baseURL := strings.TrimSuffix(s.apiURL, "/posts")
+	baseURL = strings.TrimSuffix(baseURL, "/api")
+	avatarURL := fmt.Sprintf("%s/api/agents/%s/avatar", baseURL, agentID)
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", avatarURL, bytes.NewReader(jsonData))
+	if err != nil {
+		return "", fmt.Errorf("failed to create avatar request: %w", err)
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("X-API-Key", apiKey)
+
+	resp, err := s.client.Do(httpReq)
+	if err != nil {
+		return "", fmt.Errorf("failed to request avatar: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return "", fmt.Errorf("avatar API error: status %d", resp.StatusCode)
+	}
+
+	var avatarResp AvatarResponse
+	if err := json.NewDecoder(resp.Body).Decode(&avatarResp); err != nil {
+		return "", fmt.Errorf("failed to decode avatar response: %w", err)
+	}
+
+	if avatarResp.Error != "" {
+		return "", fmt.Errorf("avatar generation error: %s", avatarResp.Error)
+	}
+
+	log.Printf("[social] Generated DC Comics avatar for %s: %s", persona.Name, avatarResp.AvatarUrl)
+	return avatarResp.AvatarUrl, nil
+}
+
 // Publish posts to the Hellotron social feed API.
 func (s *SocialClient) Publish(ctx context.Context, post *SocialPost) error {
 	if s.apiURL == "" {

@@ -24,6 +24,12 @@ import (
 // xmlTagPattern matches XML-style tags used for tool calls and results
 var xmlTagPattern = regexp.MustCompile(`(?s)<[a-z_:]+[^>]*>.*?</[a-z_:]+>`)
 
+// personaPrefixPattern matches "persona:" or "persona," at the start of a message (case-insensitive)
+var personaPrefixPattern = regexp.MustCompile(`(?i)^(tony|maya|alex|jordan|riley)[,:]\s*`)
+
+// routerResponsePattern extracts the persona name from Tron's routing decision
+var routerResponsePattern = regexp.MustCompile(`(?i)\b(tony|maya|alex|jordan|riley)\b`)
+
 const (
 	maxToolLoops            = 10
 	slackSynthesisDelay     = 30 * time.Minute
@@ -31,6 +37,22 @@ const (
 	eventCacheTTL           = 1 * time.Hour
 	timestampValidityWindow = 5 * time.Minute
 )
+
+// tronRouterPrompt is the system prompt for Tron when acting as a router
+const tronRouterPrompt = `You are Tron, the team lead for a C-suite AI team at Hellotron. Your job is to route incoming questions to the right team member.
+
+Your team:
+- Tony (CTO): Technology, architecture, engineering, code, technical implementation
+- Maya (CMO): Marketing, brand, messaging, customer insights, content strategy
+- Alex (CFO): Finance, metrics, ROI, budgets, financial analysis
+- Jordan (COO): Operations, processes, scaling, logistics, efficiency
+- Riley (CPO): Product, UX, features, roadmap, user experience
+
+Analyze the user's message and respond with ONLY the name of the team member who should handle it.
+If the question spans multiple domains, pick the primary one.
+If it's a general greeting or unclear, respond with "Tony" as the default.
+
+Respond with just the name, nothing else. Example: "Maya"`
 
 // conversationMessage represents a message in conversation history
 type conversationMessage struct {
@@ -45,6 +67,9 @@ type Handler struct {
 	orch          *vega.Orchestrator
 	config        *dsl.Document
 	baseDir       string
+
+	// Persona this handler is for (empty means use routing)
+	persona string
 
 	// Conversation tracking
 	conversations   map[string][]conversationMessage // channel -> messages
@@ -76,14 +101,21 @@ type Handler struct {
 	wg     sync.WaitGroup
 }
 
-// NewHandler creates a new Slack event handler
+// NewHandler creates a new Slack event handler (legacy - uses routing)
 func NewHandler(client *Client, signingSecret string, orch *vega.Orchestrator, config *dsl.Document, baseDir string) *Handler {
+	return NewPersonaHandler(client, signingSecret, orch, config, baseDir, "")
+}
+
+// NewPersonaHandler creates a Slack handler for a specific persona
+// If persona is empty, falls back to routing logic
+func NewPersonaHandler(client *Client, signingSecret string, orch *vega.Orchestrator, config *dsl.Document, baseDir, persona string) *Handler {
 	h := &Handler{
 		client:          client,
 		signingSecret:   signingSecret,
 		orch:            orch,
 		config:          config,
 		baseDir:         baseDir,
+		persona:         persona,
 		conversations:   make(map[string][]conversationMessage),
 		lastActivity:    make(map[string]time.Time),
 		lastSynthesis:   make(map[string]time.Time),
@@ -100,6 +132,10 @@ func NewHandler(client *Client, signingSecret string, orch *vega.Orchestrator, c
 	// Start event cache cleanup
 	h.wg.Add(1)
 	go h.eventCacheCleanup()
+
+	if persona != "" {
+		log.Printf("[slack] Handler created for persona: %s", persona)
+	}
 
 	return h
 }
@@ -122,6 +158,8 @@ func (h *Handler) Shutdown() {
 
 // HandleEvents is the HTTP handler for Slack events
 func (h *Handler) HandleEvents(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[slack] Received event request from %s", r.RemoteAddr)
+
 	// Read body for signature verification
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -135,6 +173,7 @@ func (h *Handler) HandleEvents(w http.ResponseWriter, r *http.Request) {
 		signature := r.Header.Get("X-Slack-Signature")
 
 		if !h.verifyRequest(timestamp, signature, body) {
+			log.Printf("[slack] Invalid signature - timestamp: %s", timestamp)
 			http.Error(w, "Invalid signature", http.StatusUnauthorized)
 			return
 		}
@@ -143,9 +182,12 @@ func (h *Handler) HandleEvents(w http.ResponseWriter, r *http.Request) {
 	// Parse event
 	var payload EventPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
+		log.Printf("[slack] Failed to parse JSON: %v", err)
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
+
+	log.Printf("[slack] Event type: %s, event_id: %s", payload.Type, payload.EventID)
 
 	// Handle URL verification challenge
 	if payload.Type == "url_verification" {
@@ -248,9 +290,10 @@ func (h *Handler) processEvent(event *SlackEvent) {
 	}
 	h.conversationsMu.Unlock()
 
-	// Resolve agent based on channel name
+	// Resolve agent based on message prefix and channel name
+	ctx := context.Background()
 	channelName := h.getChannelName(event.Channel)
-	agentName := h.resolveAgentFromChannel(channelName)
+	agentName, cleanedMessage := h.resolveAgentFromMessage(ctx, channelName, event.Text)
 
 	// Build system prompt
 	agentDef, ok := h.config.Agents[agentName]
@@ -268,10 +311,23 @@ func (h *Handler) processEvent(event *SlackEvent) {
 		systemPrompt += memory.GetPromptSection(memContent)
 	}
 
-	// Add user message
+	// Add conversation history to system prompt for context
+	if len(messages) > 0 {
+		systemPrompt += "\n\n## Recent Conversation History\n"
+		for _, msg := range messages {
+			if msg.Role == "user" {
+				systemPrompt += fmt.Sprintf("User: %s\n", msg.Content)
+			} else {
+				systemPrompt += fmt.Sprintf("You: %s\n", msg.Content)
+			}
+		}
+		systemPrompt += "\n(Continue the conversation naturally, remembering the context above.)"
+	}
+
+	// Add user message (use cleaned message with prefix stripped)
 	messages = append(messages, conversationMessage{
 		Role:    "user",
-		Content: event.Text,
+		Content: cleanedMessage,
 	})
 
 	// Keep conversation window (last 20 messages)
@@ -280,7 +336,6 @@ func (h *Handler) processEvent(event *SlackEvent) {
 	}
 
 	// Process with Claude
-	ctx := context.Background()
 	response, err := h.processWithClaude(ctx, agentName, systemPrompt, messages)
 	if err != nil {
 		log.Printf("Error processing Slack message: %v", err)
@@ -332,7 +387,7 @@ func (h *Handler) processWithClaude(ctx context.Context, agentName string, syste
 	}
 
 	// Spawn process
-	proc, err := h.orch.Spawn(agent)
+	proc, err := h.orch.Spawn(agent, vega.WithTask("Slack conversation"))
 	if err != nil {
 		return "", fmt.Errorf("failed to spawn process: %w", err)
 	}
@@ -405,13 +460,98 @@ func (h *Handler) getChannelName(channelID string) string {
 	return name
 }
 
-// resolveAgentFromChannel determines which agent to use based on channel name
-// Supports: #tron (default to Tony), #tron-tony, #tron-maya, etc.
-func (h *Handler) resolveAgentFromChannel(channelName string) string {
-	// Default agent
+// parsePersonaPrefix extracts persona name and cleaned message from text
+// Returns (personaName, cleanedMessage) - personaName is empty if no prefix found
+// Supports: "tony: message", "Tony: message", "tony, message", etc.
+func parsePersonaPrefix(text string) (string, string) {
+	match := personaPrefixPattern.FindStringSubmatch(text)
+	if match == nil {
+		return "", text
+	}
+
+	// Capitalize first letter to match agent names in config
+	persona := strings.ToUpper(match[1][:1]) + strings.ToLower(match[1][1:])
+	cleaned := personaPrefixPattern.ReplaceAllString(text, "")
+
+	return persona, cleaned
+}
+
+// routeWithTron asks Tron to decide which persona should handle the message
+func (h *Handler) routeWithTron(ctx context.Context, message string) string {
 	defaultAgent := "Tony"
 
-	// Check for #tron-{agent} pattern
+	// Get a model to use (borrow from any agent config)
+	var model string
+	for _, agentDef := range h.config.Agents {
+		model = agentDef.Model
+		break
+	}
+	if model == "" {
+		model = "claude-sonnet-4-20250514"
+	}
+
+	agent := vega.Agent{
+		Name:   "Tron",
+		Model:  model,
+		System: vega.StaticPrompt(tronRouterPrompt),
+	}
+
+	proc, err := h.orch.Spawn(agent, vega.WithTask("Routing message"))
+	if err != nil {
+		log.Printf("Failed to spawn Tron router: %v", err)
+		return defaultAgent
+	}
+
+	response, err := proc.Send(ctx, message)
+	if err != nil {
+		log.Printf("Failed to get routing decision from Tron: %v", err)
+		return defaultAgent
+	}
+
+	// Extract persona name from response
+	match := routerResponsePattern.FindStringSubmatch(response)
+	if match == nil {
+		log.Printf("Tron routing response didn't match expected pattern: %q, defaulting to %s", response, defaultAgent)
+		return defaultAgent
+	}
+
+	persona := strings.ToUpper(match[1][:1]) + strings.ToLower(match[1][1:])
+
+	// Verify agent exists
+	if _, ok := h.config.Agents[persona]; !ok {
+		log.Printf("Tron routed to unknown agent %q, defaulting to %s", persona, defaultAgent)
+		return defaultAgent
+	}
+
+	log.Printf("Tron routed message to %s", persona)
+	return persona
+}
+
+// resolveAgentFromMessage determines which agent to use based on message prefix and channel
+// Priority: 1) Dedicated persona handler, 2) Message prefix (tony: ...), 3) Channel-specific (#tron-maya), 4) Tron router
+// Returns (agentName, cleanedMessage)
+func (h *Handler) resolveAgentFromMessage(ctx context.Context, channelName, messageText string) (string, string) {
+	// If this handler is dedicated to a specific persona, use it directly
+	if h.persona != "" {
+		if _, ok := h.config.Agents[h.persona]; ok {
+			return h.persona, messageText
+		}
+		log.Printf("Dedicated persona %q not found in config, falling back", h.persona)
+	}
+
+	// First, check for persona prefix in message (works in any tron channel)
+	if strings.HasPrefix(channelName, "tron") {
+		persona, cleanedText := parsePersonaPrefix(messageText)
+		if persona != "" {
+			// Verify agent exists in config
+			if _, ok := h.config.Agents[persona]; ok {
+				return persona, cleanedText
+			}
+			log.Printf("Agent %q from message prefix not found in config", persona)
+		}
+	}
+
+	// Fall back to channel-based routing for #tron-{agent} channels
 	if strings.HasPrefix(channelName, "tron-") {
 		agentName := strings.TrimPrefix(channelName, "tron-")
 		// Capitalize first letter to match agent names in config
@@ -420,12 +560,19 @@ func (h *Handler) resolveAgentFromChannel(channelName string) string {
 		}
 		// Verify agent exists in config
 		if _, ok := h.config.Agents[agentName]; ok {
-			return agentName
+			return agentName, messageText
 		}
-		log.Printf("Agent %q not found in config, falling back to %s", agentName, defaultAgent)
+		log.Printf("Agent %q not found in config", agentName)
 	}
 
-	return defaultAgent
+	// For #tron channel with no prefix, use Tron to route
+	if channelName == "tron" {
+		persona := h.routeWithTron(ctx, messageText)
+		return persona, messageText
+	}
+
+	// Ultimate fallback
+	return "Tony", messageText
 }
 
 func (h *Handler) synthesisLoop() {
@@ -506,7 +653,7 @@ func (h *Handler) synthesizeConversation(channel string) {
 		System: vega.StaticPrompt(memory.SummarizePrompt()),
 	}
 
-	proc, err := h.orch.Spawn(agent)
+	proc, err := h.orch.Spawn(agent, vega.WithTask("Summarizing conversation"))
 	if err != nil {
 		log.Printf("Failed to spawn summarizer: %v", err)
 		return

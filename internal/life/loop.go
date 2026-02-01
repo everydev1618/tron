@@ -26,6 +26,7 @@ type PersonaConfig struct {
 	Role        string   // e.g., "CTO", "CMO"
 	FocusAreas  []string // Topics this persona cares about
 	ContentTone string   // Brief description of how they communicate
+	AvatarUrl   string   // URL to the persona's avatar image (DC Comics style)
 }
 
 // Loop manages an autonomous daily routine for a persona.
@@ -135,7 +136,16 @@ func NewWithSocialClient(orch *vega.Orchestrator, persona PersonaConfig, config 
 
 // Persona returns the persona config for this loop.
 func (l *Loop) Persona() PersonaConfig {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 	return l.persona
+}
+
+// UpdatePersona updates the persona config (e.g., to set avatar URL after generation).
+func (l *Loop) UpdatePersona(p PersonaConfig) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.persona = p
 }
 
 // Start begins the persona's autonomous routine.

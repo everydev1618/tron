@@ -341,7 +341,7 @@ func (s *Server) handleElevenLabsStreamingResponse(w http.ResponseWriter, ctx co
 	}
 
 	// Spawn process
-	proc, err := s.orch.Spawn(agent)
+	proc, err := s.orch.Spawn(agent, vega.WithTask("Voice call"))
 	if err != nil {
 		s.writeSSEError(w, flusher, err)
 		return
@@ -470,7 +470,7 @@ func (s *Server) handleElevenLabsNonStreamingResponse(w http.ResponseWriter, ctx
 	}
 
 	// Spawn process
-	proc, err := s.orch.Spawn(agent)
+	proc, err := s.orch.Spawn(agent, vega.WithTask("Voice call"))
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to spawn process: %v", err), http.StatusInternalServerError)
 		return

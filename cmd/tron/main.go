@@ -181,15 +181,61 @@ func runServe(args []string) {
 	callbackRegistry := callback.NewRegistry(vapiClient, emailClient, tronCfg.TronDir, "Tony", smtpFrom)
 	srv.SetCallbackRegistry(callbackRegistry)
 
-	// Initialize Slack handler if configured
-	slackBotToken := os.Getenv("SLACK_BOT_TOKEN")
-	slackSigningSecret := os.Getenv("SLACK_SIGNING_SECRET")
+	// Initialize Slack handlers
+	// Check for per-persona Slack apps first (preferred)
+	slackPersonas := []string{"Tony", "Maya", "Alex", "Jordan", "Riley"}
 	var slackClient *slack.Client
-	if slackBotToken != "" {
-		slackClient = slack.NewClient(slackBotToken)
-		slackHandler := slack.NewHandler(slackClient, slackSigningSecret, orch, cfg, tronCfg.TronDir)
-		srv.SetSlackHandler(slackHandler)
-		log.Printf("Slack integration enabled")
+	personaSlackCount := 0
+
+	for _, persona := range slackPersonas {
+		envKey := strings.ToUpper(persona)
+		botToken := os.Getenv("SLACK_BOT_TOKEN_" + envKey)
+		signingSecret := os.Getenv("SLACK_SIGNING_SECRET_" + envKey)
+
+		if botToken != "" {
+			client := slack.NewClient(botToken)
+			handler := slack.NewPersonaHandler(client, signingSecret, orch, cfg, tronCfg.TronDir, persona)
+
+			// Build and set tools for this handler
+			vegaTools := vega.NewTools(vega.WithSandbox(tronCfg.WorkingDir))
+			vegaTools.RegisterBuiltins()
+			customTools.RegisterTo(vegaTools)
+			handler.SetTools(vegaTools)
+			handler.SetCustomTools(customTools)
+
+			srv.AddSlackHandler(persona, handler)
+			personaSlackCount++
+			log.Printf("Slack app configured for %s", persona)
+
+			// Keep reference to first client for life manager
+			if slackClient == nil {
+				slackClient = client
+			}
+		}
+	}
+
+	if personaSlackCount > 0 {
+		log.Printf("Slack integration enabled for %d personas", personaSlackCount)
+	}
+
+	// Fall back to legacy single handler if no per-persona apps but legacy env vars exist
+	if personaSlackCount == 0 {
+		slackBotToken := os.Getenv("SLACK_BOT_TOKEN")
+		slackSigningSecret := os.Getenv("SLACK_SIGNING_SECRET")
+		if slackBotToken != "" {
+			slackClient = slack.NewClient(slackBotToken)
+			slackHandler := slack.NewHandler(slackClient, slackSigningSecret, orch, cfg, tronCfg.TronDir)
+
+			// Build and set tools for handler
+			vegaTools := vega.NewTools(vega.WithSandbox(tronCfg.WorkingDir))
+			vegaTools.RegisterBuiltins()
+			customTools.RegisterTo(vegaTools)
+			slackHandler.SetTools(vegaTools)
+			slackHandler.SetCustomTools(customTools)
+
+			srv.SetSlackHandler(slackHandler)
+			log.Printf("Slack integration enabled (legacy single handler)")
+		}
 	}
 
 	// Initialize life manager for all C-suite personas
@@ -205,13 +251,20 @@ func runServe(args []string) {
 	lifeManager := life.NewManager(orch, lifeConfig)
 	lifeManager.AddDefaultPersonas()
 
-	// Set per-agent API keys if configured
+	// Set per-agent API keys and IDs if configured
 	agentKeys := map[string]string{
 		"Tony":   os.Getenv("AGENT_API_KEY_TONY"),
 		"Maya":   os.Getenv("AGENT_API_KEY_MAYA"),
 		"Alex":   os.Getenv("AGENT_API_KEY_ALEX"),
 		"Jordan": os.Getenv("AGENT_API_KEY_JORDAN"),
 		"Riley":  os.Getenv("AGENT_API_KEY_RILEY"),
+	}
+	agentIDs := map[string]string{
+		"Tony":   os.Getenv("AGENT_ID_TONY"),
+		"Maya":   os.Getenv("AGENT_ID_MAYA"),
+		"Alex":   os.Getenv("AGENT_ID_ALEX"),
+		"Jordan": os.Getenv("AGENT_ID_JORDAN"),
+		"Riley":  os.Getenv("AGENT_ID_RILEY"),
 	}
 	for name, key := range agentKeys {
 		if key != "" {
@@ -225,6 +278,16 @@ func runServe(args []string) {
 		log.Printf("Life updates will post to Slack channel: %s", lifeConfig.SlackChannel)
 	}
 	srv.SetLifeManager(lifeManager)
+
+	// Sync avatar URLs to hellotron on startup
+	if lifeConfig.SocialEnabled {
+		go func() {
+			syncCtx, syncCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer syncCancel()
+			lifeManager.SyncAvatars(syncCtx, agentIDs)
+		}()
+	}
+
 	lifeManager.Start()
 	log.Printf("Life manager started for personas: %v", lifeManager.Personas())
 

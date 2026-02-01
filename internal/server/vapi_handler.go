@@ -195,7 +195,7 @@ func (s *Server) synthesizeCallMemory(callerName, transcript string) {
 		System: vega.StaticPrompt(memory.SummarizePrompt()),
 	}
 
-	proc, err := s.orch.Spawn(agent)
+	proc, err := s.orch.Spawn(agent, vega.WithTask("Summarizing call"))
 	if err != nil {
 		log.Printf("Failed to spawn summarizer: %v", err)
 		return
