@@ -382,7 +382,7 @@ func (pt *PersonaTools) RegisterTo(tools *vega.Tools) {
 func (pt *PersonaTools) spawnAgent(ctx context.Context, params map[string]any) (string, error) {
 	agentName, _ := params["agent"].(string)
 	task, _ := params["task"].(string)
-	context, _ := params["context"].(string)
+	taskContext, _ := params["context"].(string)
 
 	// Get agent definition from config
 	agentDef, ok := pt.config.Agents[agentName]
@@ -427,20 +427,29 @@ func (pt *PersonaTools) spawnAgent(ctx context.Context, params map[string]any) (
 		}
 	}
 
-	// Spawn the process
-	proc, err := pt.orch.Spawn(agent,
+	// Build spawn options
+	spawnOpts := []vega.SpawnOption{
 		vega.WithSupervision(supervision),
 		vega.WithTask(task),
 		vega.WithWorkDir(pt.workingDir),
-	)
+		vega.WithSpawnReason(task),
+	}
+
+	// Get the parent process from context for spawn tree tracking
+	if parentProc := vega.ProcessFromContext(ctx); parentProc != nil {
+		spawnOpts = append(spawnOpts, vega.WithParent(parentProc))
+	}
+
+	// Spawn the process
+	proc, err := pt.orch.Spawn(agent, spawnOpts...)
 	if err != nil {
 		return "", fmt.Errorf("failed to spawn %s: %w", agentName, err)
 	}
 
 	// Send the initial task
 	fullTask := task
-	if context != "" {
-		fullTask = fmt.Sprintf("%s\n\nContext:\n%s", task, context)
+	if taskContext != "" {
+		fullTask = fmt.Sprintf("%s\n\nContext:\n%s", task, taskContext)
 	}
 
 	// Fire and forget - let the agent work

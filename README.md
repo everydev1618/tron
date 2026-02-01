@@ -119,6 +119,8 @@ When running `tron serve`, the following endpoints are available:
 | `GET /api/status` | System status overview (process count, session count, personas) |
 | `GET /api/processes` | List all running processes with metrics |
 | `GET /api/sessions` | List all active caller sessions |
+| `GET /api/spawn-tree` | Real-time hierarchical spawn tree of all processes |
+| `GET /api/spawn-patterns` | Historical spawn pattern analysis |
 
 #### Example: Get System Status
 
@@ -159,6 +161,80 @@ curl http://localhost:3000/api/processes
     }
   }
 ]
+```
+
+#### Example: Get Spawn Tree
+
+Returns a hierarchical tree showing how agents spawn other agents during sessions.
+
+```bash
+curl http://localhost:3000/api/spawn-tree
+```
+
+```json
+[
+  {
+    "process_id": "a1b2c3d4",
+    "agent_name": "Tony",
+    "task": "Review architecture",
+    "status": "running",
+    "spawn_depth": 0,
+    "spawn_reason": "User request",
+    "started_at": "2024-01-15T10:30:00Z",
+    "children": [
+      {
+        "process_id": "e5f6g7h8",
+        "agent_name": "Maya",
+        "task": "Draft marketing copy",
+        "status": "running",
+        "spawn_depth": 1,
+        "spawn_reason": "Delegated by Tony",
+        "started_at": "2024-01-15T10:31:00Z",
+        "children": []
+      }
+    ]
+  }
+]
+```
+
+#### Example: Get Spawn Patterns
+
+Returns historical analysis of agent delegation patterns.
+
+```bash
+curl "http://localhost:3000/api/spawn-patterns?days=7"
+```
+
+Query parameters:
+- `days` - Number of days to analyze (default: 7)
+
+```json
+{
+  "total_spawns": 45,
+  "max_depth": 3,
+  "spawns_by_agent": {
+    "Tony": 20,
+    "Alex": 15,
+    "Maya": 10
+  },
+  "spawned_by_agent": {
+    "Maya": 18,
+    "Riley": 12,
+    "Jordan": 10
+  },
+  "common_patterns": [
+    {
+      "parent": "Tony",
+      "child": "Maya",
+      "count": 12
+    },
+    {
+      "parent": "Alex",
+      "child": "Riley",
+      "count": 8
+    }
+  ]
+}
 ```
 
 ## The Team

@@ -41,8 +41,9 @@ type Server struct {
 	// ElevenLabs client for voice
 	elevenLabsClient *elevenlabs.Client
 
-	// Slack handler
-	slackHandler *slack.Handler
+	// Slack handlers (legacy single handler or per-persona handlers)
+	slackHandler  *slack.Handler            // Legacy single handler
+	slackHandlers map[string]*slack.Handler // Per-persona handlers (persona -> handler)
 
 	// Callback registry
 	callbackRegistry *callback.Registry
@@ -53,6 +54,9 @@ type Server struct {
 
 	// Life manager for triggering activities across personas
 	lifeManager LifeManager
+
+	// History store for activity logging
+	historyStore *HistoryStore
 }
 
 // LifeManager interface for managing multiple persona life loops (to avoid circular imports)
@@ -79,6 +83,8 @@ func New(orch *vega.Orchestrator, config *dsl.Document, customTools *tools.Perso
 		vapiState:         newVAPIState(),
 		subdomainRegistry: subdomainReg,
 		processManager:    procManager,
+		historyStore:      NewHistoryStore(""),
+		slackHandlers:     make(map[string]*slack.Handler),
 	}
 
 	mux := http.NewServeMux()
@@ -94,8 +100,15 @@ func New(orch *vega.Orchestrator, config *dsl.Document, customTools *tools.Perso
 	mux.HandleFunc("/ws/elevenlabs", s.handleElevenLabsWS)
 	mux.HandleFunc("/v1/elevenlabs-llm", s.handleElevenLabsLLM)
 
-	// Slack events webhook (registered if handler is set)
+	// Slack events webhooks
+	// Legacy single endpoint (uses routing)
 	mux.HandleFunc("/slack/events", s.handleSlackEvents)
+	// Per-persona endpoints (direct routing)
+	mux.HandleFunc("/slack/events/tony", s.handleSlackEventsPersona("Tony"))
+	mux.HandleFunc("/slack/events/maya", s.handleSlackEventsPersona("Maya"))
+	mux.HandleFunc("/slack/events/alex", s.handleSlackEventsPersona("Alex"))
+	mux.HandleFunc("/slack/events/jordan", s.handleSlackEventsPersona("Jordan"))
+	mux.HandleFunc("/slack/events/riley", s.handleSlackEventsPersona("Riley"))
 
 	// Caddy on-demand TLS verification endpoint
 	mux.HandleFunc("/internal/caddy-ask", s.subdomainRegistry.HandleCaddyAsk)
@@ -110,6 +123,9 @@ func New(orch *vega.Orchestrator, config *dsl.Document, customTools *tools.Perso
 	mux.HandleFunc("/api/status", s.handleAPIStatus)
 	mux.HandleFunc("/api/processes", s.handleAPIProcesses)
 	mux.HandleFunc("/api/sessions", s.handleAPISessions)
+	mux.HandleFunc("/api/history", s.handleAPIHistory)
+	mux.HandleFunc("/api/spawn-tree", s.handleAPISpawnTree)
+	mux.HandleFunc("/api/spawn-patterns", s.handleAPISpawnPatterns)
 
 	// Wrap with subdomain routing middleware
 	handler := s.subdomainRegistry.Middleware(mux)
@@ -127,6 +143,8 @@ func New(orch *vega.Orchestrator, config *dsl.Document, customTools *tools.Perso
 // SetBaseDir sets the base directory for memory and config files
 func (s *Server) SetBaseDir(dir string) {
 	s.baseDir = dir
+	// Reinitialize history store with correct base dir
+	s.historyStore = NewHistoryStore(dir)
 }
 
 // SetElevenLabsClient sets the ElevenLabs client
@@ -134,9 +152,14 @@ func (s *Server) SetElevenLabsClient(client *elevenlabs.Client) {
 	s.elevenLabsClient = client
 }
 
-// SetSlackHandler sets the Slack event handler
+// SetSlackHandler sets the Slack event handler (legacy single handler)
 func (s *Server) SetSlackHandler(handler *slack.Handler) {
 	s.slackHandler = handler
+}
+
+// AddSlackHandler adds a per-persona Slack handler
+func (s *Server) AddSlackHandler(persona string, handler *slack.Handler) {
+	s.slackHandlers[persona] = handler
 }
 
 // SetCallbackRegistry sets the callback registry
@@ -166,8 +189,13 @@ func (s *Server) ListenAndServe() error {
 
 // Shutdown gracefully shuts down the server
 func (s *Server) Shutdown(ctx context.Context) error {
+	// Shutdown legacy slack handler
 	if s.slackHandler != nil {
 		s.slackHandler.Shutdown()
+	}
+	// Shutdown per-persona slack handlers
+	for _, handler := range s.slackHandlers {
+		handler.Shutdown()
 	}
 	if s.processManager != nil {
 		s.processManager.Shutdown()
@@ -175,13 +203,25 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return s.httpServer.Shutdown(ctx)
 }
 
-// handleSlackEvents delegates to the Slack handler if configured
+// handleSlackEvents delegates to the Slack handler if configured (legacy endpoint)
 func (s *Server) handleSlackEvents(w http.ResponseWriter, r *http.Request) {
 	if s.slackHandler == nil {
 		http.Error(w, "Slack not configured", http.StatusServiceUnavailable)
 		return
 	}
 	s.slackHandler.HandleEvents(w, r)
+}
+
+// handleSlackEventsPersona returns a handler for a specific persona's Slack events
+func (s *Server) handleSlackEventsPersona(persona string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		handler, ok := s.slackHandlers[persona]
+		if !ok {
+			http.Error(w, fmt.Sprintf("Slack not configured for %s", persona), http.StatusServiceUnavailable)
+			return
+		}
+		handler.HandleEvents(w, r)
+	}
 }
 
 // OpenAI-compatible request/response structures
@@ -398,6 +438,15 @@ func (s *Server) getOrCreateSession(ctx context.Context, callerID, callerPhone s
 	}
 
 	s.sessions[callerID] = proc
+
+	// Record session start in history
+	s.historyStore.Record(HistoryEntry{
+		Type:      HistorySessionStart,
+		Agent:     "Tony",
+		ProcessID: proc.ID,
+		Status:    "active",
+	})
+
 	return proc, nil
 }
 
@@ -573,6 +622,31 @@ func (s *Server) CleanupStaleSessions(maxAge time.Duration) {
 	for id, proc := range s.sessions {
 		status := proc.Status()
 		if status == vega.StatusCompleted || status == vega.StatusFailed {
+			// Record session end in history
+			agentName := ""
+			if proc.Agent != nil {
+				agentName = proc.Agent.Name
+			}
+			statusStr := "completed"
+			if status == vega.StatusFailed {
+				statusStr = "failed"
+			}
+			metrics := proc.Metrics()
+			s.historyStore.Record(HistoryEntry{
+				Type:       HistorySessionEnd,
+				Agent:      agentName,
+				ProcessID:  proc.ID,
+				Status:     statusStr,
+				DurationMs: time.Since(proc.StartedAt).Milliseconds(),
+				Metrics: &HistoryMetrics{
+					InputTokens:   metrics.InputTokens,
+					OutputTokens:  metrics.OutputTokens,
+					TotalTokens:   metrics.InputTokens + metrics.OutputTokens,
+					LLMCalls:      metrics.Iterations,
+					ToolCalls:     metrics.ToolCalls,
+					EstimatedCost: metrics.CostUSD,
+				},
+			})
 			delete(s.sessions, id)
 		}
 		// Note: Could also check proc.Metrics().LastActivity for age-based cleanup
@@ -754,4 +828,96 @@ func (s *Server) handleAPISessions(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	json.NewEncoder(w).Encode(response)
+}
+
+func (s *Server) handleAPIHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse days parameter (default to 7)
+	days := 7
+	if daysParam := r.URL.Query().Get("days"); daysParam != "" {
+		if d, err := strconv.Atoi(daysParam); err == nil && d > 0 && d <= 30 {
+			days = d
+		}
+	}
+
+	response := s.historyStore.Query(days)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	json.NewEncoder(w).Encode(response)
+}
+
+// RecordProcessStart records a process start event in history
+func (s *Server) RecordProcessStart(agent, processID, task string) {
+	s.historyStore.Record(HistoryEntry{
+		Type:      HistoryProcessStart,
+		Agent:     agent,
+		ProcessID: processID,
+		Task:      task,
+		Status:    "running",
+	})
+}
+
+// RecordProcessEnd records a process end event in history
+func (s *Server) RecordProcessEnd(agent, processID, task, status string, durationMs int64, metrics *HistoryMetrics) {
+	s.historyStore.Record(HistoryEntry{
+		Type:       HistoryProcessEnd,
+		Agent:      agent,
+		ProcessID:  processID,
+		Task:       task,
+		Status:     status,
+		DurationMs: durationMs,
+		Metrics:    metrics,
+	})
+}
+
+// RecordError records an error event in history
+func (s *Server) RecordError(agent, processID, errorMsg string) {
+	s.historyStore.Record(HistoryEntry{
+		Type:      HistoryError,
+		Agent:     agent,
+		ProcessID: processID,
+		Error:     errorMsg,
+		Status:    "error",
+	})
+}
+
+// handleAPISpawnTree returns the hierarchical spawn tree of all processes
+func (s *Server) handleAPISpawnTree(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	tree := s.orch.GetSpawnTree()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	json.NewEncoder(w).Encode(tree)
+}
+
+// handleAPISpawnPatterns returns historical spawn pattern analysis
+func (s *Server) handleAPISpawnPatterns(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse days parameter (default to 7)
+	days := 7
+	if daysParam := r.URL.Query().Get("days"); daysParam != "" {
+		if d, err := strconv.Atoi(daysParam); err == nil && d > 0 && d <= 30 {
+			days = d
+		}
+	}
+
+	patterns := s.historyStore.BuildSpawnPatterns(days)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	json.NewEncoder(w).Encode(patterns)
 }
