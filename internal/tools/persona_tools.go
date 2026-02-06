@@ -1520,3 +1520,22 @@ func (pt *PersonaTools) getKnowledgeFeed(ctx context.Context, params map[string]
 func (pt *PersonaTools) GetKnowledgeStore() *knowledge.Store {
 	return pt.knowledgeStore
 }
+
+// ListServersForDisplay returns a formatted string of running servers for Slack display
+func (pt *PersonaTools) ListServersForDisplay() string {
+	if pt.processManager == nil {
+		return "Server management not available"
+	}
+
+	servers := pt.processManager.ListServers()
+	if len(servers) == 0 {
+		return "No servers currently running"
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("*Running Servers (%d):*\n", len(servers)))
+	for _, s := range servers {
+		sb.WriteString(fmt.Sprintf("• *%s*: %s (port %d, %s)\n", s.ProjectName, s.URL, s.Port, s.Status))
+	}
+	return sb.String()
+}

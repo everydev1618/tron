@@ -273,6 +273,79 @@ func (h *Handler) ClearSessions() int {
 	return count
 }
 
+// handleTronCommand checks if a message is a tron admin command and handles it
+// Returns true if the message was a command that was handled
+func (h *Handler) handleTronCommand(channel, message string) bool {
+	msg := strings.ToLower(strings.TrimSpace(message))
+
+	switch msg {
+	case "tronhelp":
+		help := `*Tron Admin Commands:*
+• *tronhelp* - Show this help message
+• *tronservers* - List all running project servers
+• *tronclearsessions* - Clear cached sessions (forces prompt refresh)
+• *tronagents* - List active agent processes`
+		h.client.SendMessage(channel, help)
+		return true
+
+	case "tronservers":
+		h.handleTronServers(channel)
+		return true
+
+	case "tronclearsessions":
+		count := h.ClearSessions()
+		h.client.SendMessage(channel, fmt.Sprintf("✓ Cleared %d session(s). Next message will use fresh prompts.", count))
+		return true
+
+	case "tronagents":
+		h.handleTronAgents(channel)
+		return true
+	}
+
+	return false
+}
+
+// handleTronServers lists all running servers
+func (h *Handler) handleTronServers(channel string) {
+	// Try to get server list from customTools (PersonaTools)
+	if h.customTools == nil {
+		h.client.SendMessage(channel, "Server management not available")
+		return
+	}
+
+	// Use type assertion to access PersonaTools methods
+	type serverLister interface {
+		ListServersForDisplay() string
+	}
+
+	if lister, ok := h.customTools.(serverLister); ok {
+		result := lister.ListServersForDisplay()
+		h.client.SendMessage(channel, result)
+	} else {
+		h.client.SendMessage(channel, "Server listing not available")
+	}
+}
+
+// handleTronAgents lists active agent processes
+func (h *Handler) handleTronAgents(channel string) {
+	processes := h.orch.List()
+	if len(processes) == 0 {
+		h.client.SendMessage(channel, "No active agent processes")
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("*Active Agents (%d):*\n", len(processes)))
+	for _, p := range processes {
+		name := "Unknown"
+		if p.Agent != nil {
+			name = p.Agent.Name
+		}
+		sb.WriteString(fmt.Sprintf("• *%s* (ID: %s) - Status: %s\n", name, p.ID[:8], p.Status()))
+	}
+	h.client.SendMessage(channel, sb.String())
+}
+
 // HandleEvents is the HTTP handler for Slack events
 func (h *Handler) HandleEvents(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[slack] Received event request from %s", r.RemoteAddr)
@@ -438,6 +511,11 @@ func (h *Handler) processEvent(event *SlackEvent) {
 	if cleanedMessage == "" {
 		log.Printf("[slack] Empty message content after cleaning, skipping")
 		return
+	}
+
+	// Check for tron admin commands
+	if h.handleTronCommand(event.Channel, cleanedMessage) {
+		return // Command was handled
 	}
 
 	// Get or create persistent session for this channel
