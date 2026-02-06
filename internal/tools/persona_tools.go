@@ -489,9 +489,12 @@ func (pt *PersonaTools) spawnAgent(ctx context.Context, params map[string]any) (
 		return "", fmt.Errorf("unknown team member: %s", agentName)
 	}
 
-	// Build the agent
+	// Build the agent with both builtin and custom tools
 	vegaTools := vega.NewTools(vega.WithSandbox(pt.workingDir))
 	vegaTools.RegisterBuiltins()
+
+	// Register custom persona tools (list_servers, start_server, etc.)
+	pt.RegisterTo(vegaTools)
 
 	if len(agentDef.Tools) > 0 {
 		vegaTools = vegaTools.Filter(agentDef.Tools...)

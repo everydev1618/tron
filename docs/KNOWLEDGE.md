@@ -411,24 +411,72 @@ if ks := customTools.GetKnowledgeStore(); ks != nil {
 
 ---
 
+## Implementation Status
+
+| Phase | Status | Description |
+|-------|--------|-------------|
+| Phase 1: Core Storage | ✅ Complete | KnowledgeStore, CRUD, persistence |
+| Phase 2: Query & Feed | ✅ Complete | Index, tools, feed generation |
+| Phase 3: Prompt Injection | ✅ Complete | Slack + server integration |
+| Phase 4: Automatic Capture | ⏳ TODO | Auto-capture task results on completion |
+| Phase 5: Enhanced Search | ⏳ Future | Full-text and semantic search |
+| Phase 6: Knowledge Graph | ⏳ Future | Cross-references and lineage |
+
+See [TODO.md](TODO.md) for full roadmap and implementation details.
+
+---
+
 ## Future Enhancements
 
-Potential improvements for later:
+### Phase 4: Automatic Capture (Next)
 
-1. **Automatic capture**: Hook `OnProcessComplete` to auto-capture task results
-2. **Real-time propagation**: Event bus for instant knowledge sharing
-3. **Semantic search**: Vector embeddings for similarity-based queries
-4. **Importance ranking**: Decay older entries, boost highly-referenced ones
-5. **Cross-reference**: Link related entries together
+Hook `OnProcessComplete` to automatically capture task results:
+
+```go
+orch.OnProcessComplete(func(p *vega.Process, result string) {
+    if p.Task != "" {
+        store.Add(knowledge.Entry{
+            Type:    knowledge.TypeTaskResult,
+            Author:  p.Agent.Name,
+            Title:   summarize(p.Task),
+            Content: result,
+            Source:  &knowledge.Source{ProcessID: p.ID},
+        })
+    }
+})
+```
+
+### Phase 5: Enhanced Search
+
+- Full-text search within content
+- Semantic search with vector embeddings
+- Relevance scoring based on recency and references
+
+### Phase 6: Knowledge Graph
+
+- Cross-reference related entries
+- Track knowledge lineage (insight → decision → result)
+- Visualize knowledge flow between agents
+
+### Govega Dependencies
+
+Some enhancements require govega changes:
+
+| Feature | Govega Change | Status |
+|---------|---------------|--------|
+| Automatic capture | None (use existing `OnProcessComplete`) | Ready |
+| Process metadata | Add `Metadata` field to Process | TODO |
+| Real-time events | Add event bus | Future |
 
 ---
 
 ## Changelog
 
-### v1.0.0 (2024-01)
+### v1.0.0 (February 2025)
 
-- Initial implementation
+- Initial implementation (Phases 1-3)
 - Core storage with 30-day rolling window
 - Three tools: `share_knowledge`, `query_knowledge`, `get_knowledge_feed`
 - Prompt injection for Slack and server sessions
 - Index for fast queries by domain/author/tag/type
+- Full documentation
