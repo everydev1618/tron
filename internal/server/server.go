@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -70,8 +71,9 @@ type LifeManager interface {
 
 // New creates a new server instance
 func New(orch *vega.Orchestrator, config *dsl.Document, customTools *tools.PersonaTools, port int, workingDir string) *Server {
-	// Initialize subdomain routing
-	subdomainReg := subdomain.NewRegistry()
+	// Initialize subdomain routing with persistence
+	dataDir := filepath.Join(workingDir, "vega.work", "data")
+	subdomainReg := subdomain.NewRegistry(dataDir)
 	procManager := subdomain.NewProcessManager(subdomainReg)
 
 	s := &Server{
@@ -114,6 +116,10 @@ func New(orch *vega.Orchestrator, config *dsl.Document, customTools *tools.Perso
 
 	// Caddy on-demand TLS verification endpoint
 	mux.HandleFunc("/internal/caddy-ask", s.subdomainRegistry.HandleCaddyAsk)
+
+	// Subdomain management endpoints
+	mux.HandleFunc("/internal/subdomains", s.handleSubdomainList)
+	mux.HandleFunc("/internal/subdomains/register", s.handleSubdomainRegister)
 
 	// Health check
 	mux.HandleFunc("/health", s.handleHealth)
@@ -961,4 +967,49 @@ func (s *Server) handleAPISpawnPatterns(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	json.NewEncoder(w).Encode(patterns)
+}
+
+// handleSubdomainList returns all registered subdomains
+func (s *Server) handleSubdomainList(w http.ResponseWriter, r *http.Request) {
+	allocations := s.subdomainRegistry.List()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"allocations": allocations,
+		"count":       len(allocations),
+	})
+}
+
+// handleSubdomainRegister registers an existing subdomain
+func (s *Server) handleSubdomainRegister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Project   string `json:"project"`
+		Subdomain string `json:"subdomain"`
+		Port      int    `json:"port"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if req.Project == "" || req.Subdomain == "" || req.Port == 0 {
+		http.Error(w, "project, subdomain, and port are required", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.subdomainRegistry.RegisterExisting(req.Project, req.Subdomain, req.Port); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"success": true,
+		"url":     fmt.Sprintf("https://%s.hellotron.com", req.Subdomain),
+	})
 }

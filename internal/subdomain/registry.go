@@ -4,11 +4,15 @@ package subdomain
 import (
 	"crypto/rand"
 	"encoding/base32"
+	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 )
@@ -37,15 +41,98 @@ type Registry struct {
 
 	// project → subdomain mapping (for lookup by project name)
 	projects map[string]string
+
+	// dataDir for persistence
+	dataDir string
 }
 
-// NewRegistry creates a new subdomain registry.
-func NewRegistry() *Registry {
-	return &Registry{
+// registryState is the JSON-serializable state for persistence
+type registryState struct {
+	Allocations []allocationRecord `json:"allocations"`
+}
+
+type allocationRecord struct {
+	Project   string `json:"project"`
+	Subdomain string `json:"subdomain"`
+	Port      int    `json:"port"`
+}
+
+// NewRegistry creates a new subdomain registry with optional persistence.
+func NewRegistry(dataDir ...string) *Registry {
+	r := &Registry{
 		subdomains: make(map[string]int),
 		ports:      make(map[int]string),
 		projects:   make(map[string]string),
 	}
+
+	if len(dataDir) > 0 && dataDir[0] != "" {
+		r.dataDir = dataDir[0]
+		if err := r.load(); err != nil {
+			log.Printf("[subdomain] Failed to load registry state: %v", err)
+		}
+	}
+
+	return r
+}
+
+// load reads the registry state from disk
+func (r *Registry) load() error {
+	if r.dataDir == "" {
+		return nil
+	}
+
+	path := filepath.Join(r.dataDir, "subdomain_registry.json")
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil // No state file yet
+	}
+	if err != nil {
+		return err
+	}
+
+	var state registryState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return err
+	}
+
+	// Restore allocations
+	for _, alloc := range state.Allocations {
+		r.subdomains[alloc.Subdomain] = alloc.Port
+		r.ports[alloc.Port] = alloc.Subdomain
+		r.projects[alloc.Project] = alloc.Subdomain
+	}
+
+	log.Printf("[subdomain] Loaded %d allocations from disk", len(state.Allocations))
+	return nil
+}
+
+// save writes the registry state to disk
+func (r *Registry) save() error {
+	if r.dataDir == "" {
+		return nil
+	}
+
+	var state registryState
+	for project, subdomain := range r.projects {
+		port := r.subdomains[subdomain]
+		state.Allocations = append(state.Allocations, allocationRecord{
+			Project:   project,
+			Subdomain: subdomain,
+			Port:      port,
+		})
+	}
+
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(r.dataDir, 0755); err != nil {
+		return err
+	}
+
+	path := filepath.Join(r.dataDir, "subdomain_registry.json")
+	return os.WriteFile(path, data, 0644)
 }
 
 // Allocation represents an allocated subdomain and port.
@@ -88,6 +175,11 @@ func (r *Registry) Allocate(projectName string) (*Allocation, error) {
 	r.ports[port] = subdomain
 	r.projects[projectName] = subdomain
 
+	// Persist to disk
+	if err := r.save(); err != nil {
+		log.Printf("[subdomain] Failed to save registry state: %v", err)
+	}
+
 	return &Allocation{
 		Subdomain: subdomain,
 		Port:      port,
@@ -110,6 +202,42 @@ func (r *Registry) Release(projectName string) {
 	delete(r.projects, projectName)
 	delete(r.subdomains, subdomain)
 	delete(r.ports, port)
+
+	// Persist to disk
+	if err := r.save(); err != nil {
+		log.Printf("[subdomain] Failed to save registry state: %v", err)
+	}
+}
+
+// RegisterExisting registers an existing subdomain/port allocation.
+// Used to recover orphaned processes or manually configure known services.
+func (r *Registry) RegisterExisting(projectName, subdomainName string, port int) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Check for conflicts
+	if existing, exists := r.projects[projectName]; exists {
+		return fmt.Errorf("project %q already has subdomain %s", projectName, existing)
+	}
+	if _, exists := r.subdomains[subdomainName]; exists {
+		return fmt.Errorf("subdomain %q already allocated", subdomainName)
+	}
+	if _, exists := r.ports[port]; exists {
+		return fmt.Errorf("port %d already allocated", port)
+	}
+
+	// Register
+	r.subdomains[subdomainName] = port
+	r.ports[port] = subdomainName
+	r.projects[projectName] = subdomainName
+
+	// Persist to disk
+	if err := r.save(); err != nil {
+		log.Printf("[subdomain] Failed to save registry state: %v", err)
+	}
+
+	log.Printf("[subdomain] Registered existing: %s -> %s.%s:%d", projectName, subdomainName, Domain, port)
+	return nil
 }
 
 // GetBySubdomain returns the port for a subdomain.
