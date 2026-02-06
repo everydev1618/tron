@@ -15,9 +15,10 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/martellcode/tron/internal/memory"
-	"github.com/martellcode/tron/internal/voice/elevenlabs"
-	"github.com/martellcode/vega"
+	"github.com/everydev1618/tron/internal/memory"
+	"github.com/everydev1618/tron/internal/notification"
+	"github.com/everydev1618/tron/internal/voice/elevenlabs"
+	"github.com/everydev1618/govega"
 )
 
 var upgrader = websocket.Upgrader{
@@ -308,6 +309,12 @@ func (s *Server) handleElevenLabsLLM(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleElevenLabsStreamingResponse(w http.ResponseWriter, ctx context.Context, systemPrompt, message, conversationID string) {
+	// Add channel context for spawn notifications
+	ctx = notification.WithChannel(ctx, notification.ChannelContext{
+		Type:   notification.ChannelVoice,
+		UserID: conversationID,
+	})
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -426,6 +433,13 @@ func (s *Server) handleElevenLabsStreamingResponse(w http.ResponseWriter, ctx co
 done:
 	flushTimeout.Stop()
 
+	// Mark process as completed
+	if err := stream.Err(); err != nil {
+		proc.Fail(err)
+	} else {
+		proc.Complete(stream.Response())
+	}
+
 	// Send final chunk
 	finishReason := "stop"
 	finalChunk := openAIChatResponse{
@@ -446,6 +460,12 @@ done:
 }
 
 func (s *Server) handleElevenLabsNonStreamingResponse(w http.ResponseWriter, ctx context.Context, systemPrompt, message, conversationID string) {
+	// Add channel context for spawn notifications
+	ctx = notification.WithChannel(ctx, notification.ChannelContext{
+		Type:   notification.ChannelVoice,
+		UserID: conversationID,
+	})
+
 	// Get Tony definition
 	tonyDef, ok := s.config.Agents["Tony"]
 	if !ok {
@@ -478,9 +498,13 @@ func (s *Server) handleElevenLabsNonStreamingResponse(w http.ResponseWriter, ctx
 
 	response, err := proc.Send(ctx, message)
 	if err != nil {
+		proc.Fail(err)
 		http.Error(w, fmt.Sprintf("Failed to get response: %v", err), http.StatusInternalServerError)
 		return
 	}
+
+	// Mark process as completed
+	proc.Complete(response)
 
 	finishReason := "stop"
 	chatResponse := openAIChatResponse{

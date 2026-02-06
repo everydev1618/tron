@@ -1,10 +1,10 @@
-module github.com/martellcode/tron
+module github.com/everydev1618/tron
 
 go 1.25.4
 
 require (
 	github.com/gorilla/websocket v1.5.1
-	github.com/martellcode/vega v0.0.0-20260130202140-e4be95b13d88
+	github.com/everydev1618/govega v0.0.0-20260130202140-e4be95b13d88
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -43,4 +43,4 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 )
 
-replace github.com/martellcode/vega => ../govega
+replace github.com/everydev1618/govega => ../govega

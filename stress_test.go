@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/martellcode/vega"
-	"github.com/martellcode/vega/llm"
+	"github.com/everydev1618/govega"
+	"github.com/everydev1618/govega/llm"
 )
 
 // =============================================================================

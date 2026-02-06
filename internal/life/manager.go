@@ -6,7 +6,7 @@ import (
 	"log"
 	"sync"
 
-	"github.com/martellcode/vega"
+	"github.com/everydev1618/govega"
 )
 
 // Manager orchestrates life loops for multiple personas.

@@ -12,13 +12,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/martellcode/tron/internal/callback"
-	"github.com/martellcode/tron/internal/slack"
-	"github.com/martellcode/tron/internal/subdomain"
-	"github.com/martellcode/tron/internal/tools"
-	"github.com/martellcode/tron/internal/voice/elevenlabs"
-	"github.com/martellcode/vega"
-	"github.com/martellcode/vega/dsl"
+	"github.com/everydev1618/tron/internal/callback"
+	"github.com/everydev1618/tron/internal/knowledge"
+	"github.com/everydev1618/tron/internal/notification"
+	"github.com/everydev1618/tron/internal/slack"
+	"github.com/everydev1618/tron/internal/subdomain"
+	"github.com/everydev1618/tron/internal/tools"
+	"github.com/everydev1618/tron/internal/voice/elevenlabs"
+	"github.com/everydev1618/govega"
+	"github.com/everydev1618/govega/dsl"
 )
 
 // Server handles VAPI webhooks and provides OpenAI-compatible chat completions
@@ -160,6 +162,21 @@ func (s *Server) SetSlackHandler(handler *slack.Handler) {
 // AddSlackHandler adds a per-persona Slack handler
 func (s *Server) AddSlackHandler(persona string, handler *slack.Handler) {
 	s.slackHandlers[persona] = handler
+}
+
+// WireSlackNotifications wires the Slack client to PersonaTools for notifications
+// Call this after adding Slack handlers
+func (s *Server) WireSlackNotifications() {
+	// Use the legacy handler's client, or any per-persona handler's client
+	if s.slackHandler != nil {
+		s.customTools.SetSlackClient(s.slackHandler.Client())
+		return
+	}
+	// Fallback to any per-persona handler
+	for _, handler := range s.slackHandlers {
+		s.customTools.SetSlackClient(handler.Client())
+		return
+	}
 }
 
 // SetCallbackRegistry sets the callback registry
@@ -379,10 +396,17 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[chat] Processing message for caller %s: %q (stream=%v)", callerID, userMessage, req.Stream)
 
+	// Add channel context for spawn notifications (VAPI/voice calls)
+	ctx := r.Context()
+	ctx = notification.WithChannel(ctx, notification.ChannelContext{
+		Type:   notification.ChannelVoice,
+		UserID: callerID,
+	})
+
 	if req.Stream {
-		s.handleStreamingResponse(w, r.Context(), proc, userMessage)
+		s.handleStreamingResponse(w, ctx, proc, userMessage)
 	} else {
-		s.handleNonStreamingResponse(w, r.Context(), proc, userMessage)
+		s.handleNonStreamingResponse(w, ctx, proc, userMessage)
 	}
 }
 
@@ -413,15 +437,28 @@ func (s *Server) getOrCreateSession(ctx context.Context, callerID, callerPhone s
 	// Build Tony agent
 	tonyAgent := s.buildAgent(tonyDef)
 
+	// Build enhanced system prompt
+	systemPrompt := tonyDef.System
+
 	// Add caller context if we have phone number
 	if callerPhone != "" {
-		// Identify the caller
 		callerInfo := s.customTools.IdentifyCaller(callerPhone)
 		if callerInfo != "" {
-			// Wrap the system prompt with caller context
-			originalSystem := tonyDef.System
-			tonyAgent.System = vega.StaticPrompt(fmt.Sprintf("%s\n\n## Current Caller\n%s", originalSystem, callerInfo))
+			systemPrompt = fmt.Sprintf("%s\n\n## Current Caller\n%s", systemPrompt, callerInfo)
 		}
+	}
+
+	// Inject knowledge feed
+	if ks := s.customTools.GetKnowledgeStore(); ks != nil {
+		feedSection := knowledge.GetFeedPromptSection(ks)
+		if feedSection != "" {
+			systemPrompt = systemPrompt + feedSection
+		}
+	}
+
+	// Update agent system prompt if we added context
+	if systemPrompt != tonyDef.System {
+		tonyAgent.System = vega.StaticPrompt(systemPrompt)
 	}
 
 	// Spawn new Tony process
@@ -590,9 +627,13 @@ func (s *Server) writeSSEError(w http.ResponseWriter, flusher http.Flusher, err 
 func (s *Server) handleNonStreamingResponse(w http.ResponseWriter, ctx context.Context, proc *vega.Process, message string) {
 	response, err := proc.Send(ctx, message)
 	if err != nil {
+		proc.Fail(err)
 		http.Error(w, fmt.Sprintf("Failed to process message: %v", err), http.StatusInternalServerError)
 		return
 	}
+
+	// Mark process as completed
+	proc.Complete(response)
 
 	finishReason := "stop"
 	chatResponse := ChatCompletionResponse{

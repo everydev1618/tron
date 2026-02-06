@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/martellcode/vega"
+	"github.com/everydev1618/govega"
 )
 
 // Reflector handles Tony's self-improvement and learning.

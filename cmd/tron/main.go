@@ -12,19 +12,19 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/martellcode/tron/internal/callback"
-	"github.com/martellcode/tron/internal/config"
-	"github.com/martellcode/tron/internal/email"
-	"github.com/martellcode/tron/internal/life"
-	"github.com/martellcode/tron/internal/server"
-	"github.com/martellcode/tron/internal/slack"
-	"github.com/martellcode/tron/internal/tools"
-	"github.com/martellcode/tron/internal/vapi"
-	"github.com/martellcode/tron/internal/voice/elevenlabs"
-	"github.com/martellcode/vega"
-	"github.com/martellcode/vega/container"
-	"github.com/martellcode/vega/dsl"
-	"github.com/martellcode/vega/llm"
+	"github.com/everydev1618/tron/internal/callback"
+	"github.com/everydev1618/tron/internal/config"
+	"github.com/everydev1618/tron/internal/email"
+	"github.com/everydev1618/tron/internal/life"
+	"github.com/everydev1618/tron/internal/server"
+	"github.com/everydev1618/tron/internal/slack"
+	"github.com/everydev1618/tron/internal/tools"
+	"github.com/everydev1618/tron/internal/vapi"
+	"github.com/everydev1618/tron/internal/voice/elevenlabs"
+	"github.com/everydev1618/govega"
+	"github.com/everydev1618/govega/container"
+	"github.com/everydev1618/govega/dsl"
+	"github.com/everydev1618/govega/llm"
 )
 
 func main() {
@@ -203,6 +203,11 @@ func runServe(args []string) {
 			handler.SetTools(vegaTools)
 			handler.SetCustomTools(customTools)
 
+			// Wire knowledge store for feed injection
+			if ks := customTools.GetKnowledgeStore(); ks != nil {
+				handler.SetKnowledgeStore(ks)
+			}
+
 			srv.AddSlackHandler(persona, handler)
 			personaSlackCount++
 			log.Printf("Slack app configured for %s", persona)
@@ -233,10 +238,18 @@ func runServe(args []string) {
 			slackHandler.SetTools(vegaTools)
 			slackHandler.SetCustomTools(customTools)
 
+			// Wire knowledge store for feed injection
+			if ks := customTools.GetKnowledgeStore(); ks != nil {
+				slackHandler.SetKnowledgeStore(ks)
+			}
+
 			srv.SetSlackHandler(slackHandler)
 			log.Printf("Slack integration enabled (legacy single handler)")
 		}
 	}
+
+	// Wire Slack client to PersonaTools for spawn completion notifications
+	srv.WireSlackNotifications()
 
 	// Initialize life manager for all C-suite personas
 	lifeConfig := life.DefaultConfig(tronCfg.TronDir)

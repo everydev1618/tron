@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/smtp"
 	"os"
@@ -14,12 +15,19 @@ import (
 	"sync"
 	"time"
 
-	"github.com/martellcode/tron/internal/subdomain"
-	"github.com/martellcode/vega"
-	"github.com/martellcode/vega/container"
-	"github.com/martellcode/vega/dsl"
+	"github.com/everydev1618/tron/internal/knowledge"
+	"github.com/everydev1618/tron/internal/notification"
+	"github.com/everydev1618/tron/internal/subdomain"
+	"github.com/everydev1618/govega"
+	"github.com/everydev1618/govega/container"
+	"github.com/everydev1618/govega/dsl"
 	"gopkg.in/yaml.v3"
 )
+
+// SlackPoster interface for sending Slack messages (for testability)
+type SlackPoster interface {
+	SendMessage(channel, text string) error
+}
 
 // PersonaTools provides Tony's orchestration tools
 type PersonaTools struct {
@@ -40,11 +48,21 @@ type PersonaTools struct {
 	callbacks   map[string]CallbackConfig
 	callbacksMu sync.RWMutex
 
+	// Channel context for spawned processes (for notifications)
+	processChannels   map[string]notification.ChannelContext
+	processChannelsMu sync.RWMutex
+
+	// Slack client for notifications
+	slackClient SlackPoster
+
 	// Memory storage
 	directives    map[string]string
 	personMemory  map[string]map[string]string
 	directivesMu  sync.RWMutex
 	personMemMu   sync.RWMutex
+
+	// Shared knowledge store
+	knowledgeStore *knowledge.Store
 }
 
 // CallbackConfig stores callback information for spawned agents
@@ -75,15 +93,23 @@ type Contact struct {
 // NewPersonaTools creates a new PersonaTools instance
 func NewPersonaTools(orch *vega.Orchestrator, config *dsl.Document, workingDir, tronDir string, cm *container.Manager) *PersonaTools {
 	pt := &PersonaTools{
-		orch:         orch,
-		config:       config,
-		contacts:     &ContactDB{contacts: make(map[string]Contact)},
-		workingDir:   workingDir,
-		tronDir:      tronDir,
-		containers:   cm,
-		callbacks:    make(map[string]CallbackConfig),
-		directives:   make(map[string]string),
-		personMemory: make(map[string]map[string]string),
+		orch:            orch,
+		config:          config,
+		contacts:        &ContactDB{contacts: make(map[string]Contact)},
+		workingDir:      workingDir,
+		tronDir:         tronDir,
+		containers:      cm,
+		callbacks:       make(map[string]CallbackConfig),
+		processChannels: make(map[string]notification.ChannelContext),
+		directives:      make(map[string]string),
+		personMemory:    make(map[string]map[string]string),
+	}
+
+	// Initialize shared knowledge store
+	if ks, err := knowledge.NewStore(tronDir); err == nil {
+		pt.knowledgeStore = ks
+	} else {
+		log.Printf("[tools] Failed to initialize knowledge store: %v", err)
 	}
 
 	// Create project registry if container manager is available
@@ -376,6 +402,79 @@ func (pt *PersonaTools) RegisterTo(tools *vega.Tools) {
 		Fn:          pt.listProjects,
 		Params:      map[string]vega.ParamDef{},
 	})
+
+	// share_knowledge - Share a discovery, insight, or decision with the team
+	tools.Register("share_knowledge", vega.ToolDef{
+		Description: "Share a discovery, insight, decision, or task result with the team. Other team members will see this in their knowledge feed.",
+		Fn:          pt.shareKnowledge,
+		Params: map[string]vega.ParamDef{
+			"type": {
+				Type:        "string",
+				Description: "Type of knowledge: discovery, insight, decision, task_result, or resource",
+				Required:    true,
+			},
+			"title": {
+				Type:        "string",
+				Description: "Brief title summarizing the knowledge (1-2 sentences)",
+				Required:    true,
+			},
+			"content": {
+				Type:        "string",
+				Description: "Full details of the knowledge to share",
+				Required:    true,
+			},
+			"domain": {
+				Type:        "string",
+				Description: "Domain: tech, marketing, finance, ops, product, or general (defaults to your domain)",
+				Required:    false,
+			},
+			"tags": {
+				Type:        "string",
+				Description: "Comma-separated tags for categorization",
+				Required:    false,
+			},
+		},
+	})
+
+	// query_knowledge - Search the shared knowledge base
+	tools.Register("query_knowledge", vega.ToolDef{
+		Description: "Search the shared knowledge base for entries by domain, author, type, or tags. Use this to find what other team members have discovered.",
+		Fn:          pt.queryKnowledge,
+		Params: map[string]vega.ParamDef{
+			"domain": {
+				Type:        "string",
+				Description: "Filter by domain: tech, marketing, finance, ops, product, general",
+				Required:    false,
+			},
+			"author": {
+				Type:        "string",
+				Description: "Filter by author name (e.g., Tony, Maya, Gary)",
+				Required:    false,
+			},
+			"type": {
+				Type:        "string",
+				Description: "Filter by type: discovery, insight, decision, task_result, resource",
+				Required:    false,
+			},
+			"tags": {
+				Type:        "string",
+				Description: "Comma-separated tags to filter by",
+				Required:    false,
+			},
+			"limit": {
+				Type:        "number",
+				Description: "Maximum number of results (default 10)",
+				Required:    false,
+			},
+		},
+	})
+
+	// get_knowledge_feed - Get recent team activity
+	tools.Register("get_knowledge_feed", vega.ToolDef{
+		Description: "Get a digest of recent team knowledge and activity from the last 24 hours. Shows what other team members have discovered or decided.",
+		Fn:          pt.getKnowledgeFeed,
+		Params:      map[string]vega.ParamDef{},
+	})
 }
 
 // spawnAgent spawns a team member agent
@@ -452,8 +551,28 @@ func (pt *PersonaTools) spawnAgent(ctx context.Context, params map[string]any) (
 		fullTask = fmt.Sprintf("%s\n\nContext:\n%s", task, taskContext)
 	}
 
-	// Fire and forget - let the agent work
-	proc.SendAsync(fullTask)
+	// After spawning, capture channel context for automatic notifications
+	if ch, ok := notification.ChannelFromContext(ctx); ok {
+		pt.processChannelsMu.Lock()
+		pt.processChannels[proc.ID] = ch
+		pt.processChannelsMu.Unlock()
+	}
+
+	// Set up the callback handler (idempotent, only runs once)
+	pt.setupCallbackHandlerOnce()
+
+	// Send the task and handle completion in background
+	future := proc.SendAsync(fullTask)
+
+	// Wait for completion and mark process as done
+	go func() {
+		result, err := future.Await(context.Background())
+		if err != nil {
+			proc.Fail(err)
+		} else {
+			proc.Complete(result)
+		}
+	}()
 
 	return fmt.Sprintf("Spawned %s (process ID: %s) to work on: %s", agentName, proc.ID, task), nil
 }
@@ -530,6 +649,7 @@ var callbackHandlerSetup sync.Once
 func (pt *PersonaTools) setupCallbackHandlerOnce() {
 	callbackHandlerSetup.Do(func() {
 		pt.orch.OnProcessComplete(func(p *vega.Process, result string) {
+			// Existing email callback logic
 			pt.callbacksMu.RLock()
 			callback, ok := pt.callbacks[p.ID]
 			pt.callbacksMu.RUnlock()
@@ -541,6 +661,18 @@ func (pt *PersonaTools) setupCallbackHandlerOnce() {
 				pt.callbacksMu.Lock()
 				delete(pt.callbacks, p.ID)
 				pt.callbacksMu.Unlock()
+			}
+
+			// Channel-aware notifications
+			pt.processChannelsMu.RLock()
+			ch, hasChannel := pt.processChannels[p.ID]
+			pt.processChannelsMu.RUnlock()
+
+			if hasChannel {
+				pt.notifyChannel(ch, p, result)
+				pt.processChannelsMu.Lock()
+				delete(pt.processChannels, p.ID)
+				pt.processChannelsMu.Unlock()
 			}
 		})
 	})
@@ -572,6 +704,55 @@ func (pt *PersonaTools) sendCallbackEmail(to, subject, body string) error {
 
 	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
 	return smtp.SendMail(smtpHost+":"+smtpPort, auth, fromEmail, []string{to}, []byte(msg))
+}
+
+// SetSlackClient sets the Slack client for sending notifications
+func (pt *PersonaTools) SetSlackClient(client SlackPoster) {
+	pt.slackClient = client
+}
+
+// notifyChannel sends a completion notification to the appropriate channel
+func (pt *PersonaTools) notifyChannel(ch notification.ChannelContext, p *vega.Process, result string) {
+	agentName := "Agent"
+	if p.Agent != nil {
+		agentName = p.Agent.Name
+	}
+
+	switch ch.Type {
+	case notification.ChannelSlack:
+		if pt.slackClient != nil {
+			msg := fmt.Sprintf("*%s* completed: _%s_\n\n%s",
+				agentName, p.Task, summarizeResult(result, 500))
+			if err := pt.slackClient.SendMessage(ch.ChannelID, msg); err != nil {
+				log.Printf("[notification] Failed to send Slack notification: %v", err)
+			}
+		} else {
+			log.Printf("[notification] Slack client not configured, cannot notify channel %s", ch.ChannelID)
+		}
+
+	case notification.ChannelVoice:
+		// Voice calls have ended - send email if available
+		if ch.Email != "" {
+			pt.sendCallbackEmail(ch.Email,
+				fmt.Sprintf("%s completed your request", agentName),
+				result)
+		} else {
+			// Otherwise log only - user can't be notified
+			log.Printf("[notification] Voice call completed for %s, no notification channel available", ch.UserID)
+		}
+
+	case notification.ChannelAPI:
+		// API calls are synchronous, no notification needed
+		log.Printf("[notification] API process %s completed", p.ID)
+	}
+}
+
+// summarizeResult truncates result to maxLen characters
+func summarizeResult(result string, maxLen int) string {
+	if len(result) <= maxLen {
+		return result
+	}
+	return result[:maxLen] + "..."
 }
 
 // identifyCallerTool wraps IdentifyCaller as a tool
@@ -1172,4 +1353,167 @@ func (pt *PersonaTools) listProjects(ctx context.Context, params map[string]any)
 	}
 
 	return result.String(), nil
+}
+
+// shareKnowledge shares a discovery, insight, or decision with the team
+func (pt *PersonaTools) shareKnowledge(ctx context.Context, params map[string]any) (string, error) {
+	if pt.knowledgeStore == nil {
+		return "", fmt.Errorf("knowledge store not available")
+	}
+
+	entryType, _ := params["type"].(string)
+	title, _ := params["title"].(string)
+	content, _ := params["content"].(string)
+	domain, _ := params["domain"].(string)
+	tagsStr, _ := params["tags"].(string)
+
+	if title == "" {
+		return "", fmt.Errorf("title is required")
+	}
+	if content == "" {
+		return "", fmt.Errorf("content is required")
+	}
+
+	// Determine author from process context
+	author := "Unknown"
+	if proc := vega.ProcessFromContext(ctx); proc != nil && proc.Agent != nil {
+		author = proc.Agent.Name
+	}
+
+	// Parse tags
+	var tags []string
+	if tagsStr != "" {
+		for _, t := range strings.Split(tagsStr, ",") {
+			t = strings.TrimSpace(t)
+			if t != "" {
+				tags = append(tags, t)
+			}
+		}
+	}
+
+	// Map type string to EntryType
+	var kt knowledge.EntryType
+	switch strings.ToLower(entryType) {
+	case "discovery":
+		kt = knowledge.TypeDiscovery
+	case "insight":
+		kt = knowledge.TypeInsight
+	case "decision":
+		kt = knowledge.TypeDecision
+	case "task_result":
+		kt = knowledge.TypeTaskResult
+	case "resource":
+		kt = knowledge.TypeResource
+	default:
+		kt = knowledge.TypeDiscovery
+	}
+
+	// Map domain string to Domain
+	var kd knowledge.Domain
+	switch strings.ToLower(domain) {
+	case "tech":
+		kd = knowledge.DomainTech
+	case "marketing":
+		kd = knowledge.DomainMarketing
+	case "finance":
+		kd = knowledge.DomainFinance
+	case "ops":
+		kd = knowledge.DomainOps
+	case "product":
+		kd = knowledge.DomainProduct
+	default:
+		// Default to author's domain
+		kd = knowledge.DomainFromPersona(author)
+	}
+
+	// Build source from context
+	var source *knowledge.Source
+	if proc := vega.ProcessFromContext(ctx); proc != nil {
+		source = &knowledge.Source{
+			ProcessID: proc.ID,
+		}
+	}
+
+	entry := knowledge.Entry{
+		Type:    kt,
+		Domain:  kd,
+		Author:  author,
+		Title:   title,
+		Content: content,
+		Tags:    tags,
+		Source:  source,
+	}
+
+	if err := pt.knowledgeStore.Add(entry); err != nil {
+		return "", fmt.Errorf("failed to save knowledge: %w", err)
+	}
+
+	return fmt.Sprintf("Knowledge shared: [%s] %s\nThis will appear in the team's knowledge feed.", kt, title), nil
+}
+
+// queryKnowledge searches the shared knowledge base
+func (pt *PersonaTools) queryKnowledge(ctx context.Context, params map[string]any) (string, error) {
+	if pt.knowledgeStore == nil {
+		return "", fmt.Errorf("knowledge store not available")
+	}
+
+	domain, _ := params["domain"].(string)
+	author, _ := params["author"].(string)
+	entryType, _ := params["type"].(string)
+	tagsStr, _ := params["tags"].(string)
+	limitFloat, _ := params["limit"].(float64)
+
+	limit := int(limitFloat)
+	if limit == 0 {
+		limit = 10
+	}
+
+	// Parse tags
+	var tags []string
+	if tagsStr != "" {
+		for _, t := range strings.Split(tagsStr, ",") {
+			t = strings.TrimSpace(t)
+			if t != "" {
+				tags = append(tags, t)
+			}
+		}
+	}
+
+	// Build query options
+	opts := knowledge.QueryOptions{
+		Limit: limit,
+		Tags:  tags,
+	}
+
+	if domain != "" {
+		opts.Domain = knowledge.Domain(strings.ToLower(domain))
+	}
+	if author != "" {
+		opts.Author = author
+	}
+	if entryType != "" {
+		opts.Type = knowledge.EntryType(strings.ToLower(entryType))
+	}
+
+	entries := pt.knowledgeStore.Query(opts)
+	return knowledge.FormatEntriesForQuery(entries), nil
+}
+
+// getKnowledgeFeed returns the recent activity feed
+func (pt *PersonaTools) getKnowledgeFeed(ctx context.Context, params map[string]any) (string, error) {
+	if pt.knowledgeStore == nil {
+		return "", fmt.Errorf("knowledge store not available")
+	}
+
+	feedSection := knowledge.GetFeedPromptSection(pt.knowledgeStore)
+	if feedSection == "" {
+		return "No recent team activity in the last 24 hours.", nil
+	}
+
+	return feedSection, nil
+}
+
+// GetKnowledgeStore returns the knowledge store for external use
+func (pt *PersonaTools) GetKnowledgeStore() *knowledge.Store {
+	return pt.knowledgeStore
 }

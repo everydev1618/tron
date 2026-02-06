@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/martellcode/vega"
+	"github.com/everydev1618/govega"
 )
 
 // TeamChecker monitors spawned agents and their work.

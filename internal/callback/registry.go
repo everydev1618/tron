@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/martellcode/tron/internal/email"
-	"github.com/martellcode/tron/internal/vapi"
+	"github.com/everydev1618/tron/internal/email"
+	"github.com/everydev1618/tron/internal/vapi"
 )
 
 // Callback represents a pending callback request

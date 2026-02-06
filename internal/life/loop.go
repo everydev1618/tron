@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/martellcode/vega"
+	"github.com/everydev1618/govega"
 )
 
 // SlackNotifier is an interface for posting to Slack (to avoid circular imports)

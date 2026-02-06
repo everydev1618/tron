@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/martellcode/tron/internal/memory"
-	"github.com/martellcode/vega"
+	"github.com/everydev1618/tron/internal/memory"
+	"github.com/everydev1618/govega"
 )
 
 const (
@@ -203,9 +203,13 @@ func (s *Server) synthesizeCallMemory(callerName, transcript string) {
 
 	summary, err := proc.Send(nil, transcript)
 	if err != nil {
+		proc.Fail(err)
 		log.Printf("Failed to summarize call: %v", err)
 		return
 	}
+
+	// Mark summarizer as completed
+	proc.Complete(summary)
 
 	if err := memory.Append(s.baseDir, callerName, summary); err != nil {
 		log.Printf("Failed to save memory: %v", err)

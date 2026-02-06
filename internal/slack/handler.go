@@ -16,9 +16,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/martellcode/tron/internal/memory"
-	"github.com/martellcode/vega"
-	"github.com/martellcode/vega/dsl"
+	"github.com/everydev1618/tron/internal/knowledge"
+	"github.com/everydev1618/tron/internal/memory"
+	"github.com/everydev1618/tron/internal/notification"
+	"github.com/everydev1618/govega"
+	"github.com/everydev1618/govega/dsl"
 )
 
 // xmlTagPattern matches XML-style tags used for tool calls and results
@@ -92,9 +94,20 @@ type Handler struct {
 	processedEvents   map[string]time.Time
 	processedEventsMu sync.RWMutex
 
+	// Per-channel processing lock to prevent concurrent agent spawns
+	channelProcessing   map[string]bool
+	channelProcessingMu sync.Mutex
+
+	// Session management - maps channel ID to persistent process
+	sessions   map[string]*vega.Process
+	sessionsMu sync.RWMutex
+
 	// Tool execution
 	tools       *vega.Tools
 	customTools interface{} // *tools.PersonaTools
+
+	// Knowledge store for feed injection
+	knowledgeStore *knowledge.Store
 
 	// Lifecycle
 	stopCh chan struct{}
@@ -120,9 +133,11 @@ func NewPersonaHandler(client *Client, signingSecret string, orch *vega.Orchestr
 		lastActivity:    make(map[string]time.Time),
 		lastSynthesis:   make(map[string]time.Time),
 		userCache:       make(map[string]*User),
-		channelCache:    make(map[string]string),
-		processedEvents: make(map[string]time.Time),
-		stopCh:          make(chan struct{}),
+		channelCache:      make(map[string]string),
+		processedEvents:   make(map[string]time.Time),
+		channelProcessing: make(map[string]bool),
+		sessions:          make(map[string]*vega.Process),
+		stopCh:            make(chan struct{}),
 	}
 
 	// Start synthesis loop
@@ -145,9 +160,94 @@ func (h *Handler) SetTools(tools *vega.Tools) {
 	h.tools = tools
 }
 
+// Client returns the Slack client for sending messages
+func (h *Handler) Client() *Client {
+	return h.client
+}
+
 // SetCustomTools sets the custom persona tools
 func (h *Handler) SetCustomTools(customTools interface{}) {
 	h.customTools = customTools
+}
+
+// SetKnowledgeStore sets the knowledge store for feed injection
+func (h *Handler) SetKnowledgeStore(store *knowledge.Store) {
+	h.knowledgeStore = store
+}
+
+// getOrCreateSession returns an existing session for the channel or creates a new one
+func (h *Handler) getOrCreateSession(ctx context.Context, channel, agentName, userName string) (*vega.Process, error) {
+	// Check for existing running session
+	h.sessionsMu.RLock()
+	proc, exists := h.sessions[channel]
+	h.sessionsMu.RUnlock()
+
+	if exists && proc.Status() == vega.StatusRunning {
+		return proc, nil
+	}
+
+	// Need to create a new session
+	h.sessionsMu.Lock()
+	defer h.sessionsMu.Unlock()
+
+	// Double-check after acquiring write lock
+	proc, exists = h.sessions[channel]
+	if exists && proc.Status() == vega.StatusRunning {
+		return proc, nil
+	}
+
+	// Get agent definition
+	agentDef, ok := h.config.Agents[agentName]
+	if !ok {
+		return nil, fmt.Errorf("%s agent not found", agentName)
+	}
+
+	// Build system prompt with context
+	systemPrompt := agentDef.System
+	systemPrompt += fmt.Sprintf("\n\n## Current Context\nChannel: Slack\nUser: %s\n", userName)
+
+	// Load memory
+	memContent, _ := memory.Load(h.baseDir)
+	if memContent != "" {
+		systemPrompt += memory.GetPromptSection(memContent)
+	}
+
+	// Inject knowledge feed
+	if h.knowledgeStore != nil {
+		feedSection := knowledge.GetFeedPromptSection(h.knowledgeStore)
+		if feedSection != "" {
+			systemPrompt += feedSection
+		}
+	}
+
+	agent := vega.Agent{
+		Name:   agentDef.Name,
+		Model:  agentDef.Model,
+		System: vega.StaticPrompt(systemPrompt),
+		Tools:  h.tools,
+	}
+
+	if agentDef.Temperature != nil {
+		agent.Temperature = agentDef.Temperature
+	}
+
+	// Spawn new process
+	proc, err := h.orch.Spawn(agent,
+		vega.WithTask("Slack conversation"),
+		vega.WithSupervision(vega.Supervision{
+			Strategy:    vega.Restart,
+			MaxRestarts: 3,
+			Window:      600_000_000_000, // 10 minutes
+		}),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to spawn process: %w", err)
+	}
+
+	h.sessions[channel] = proc
+	log.Printf("[slack] Created new session for channel %s with agent %s (process %s)", channel, agentName, proc.ID)
+
+	return proc, nil
 }
 
 // Shutdown gracefully stops the handler
@@ -267,6 +367,24 @@ func (h *Handler) processEvent(event *SlackEvent) {
 		return // Ignore non-mention messages in channels
 	}
 
+	// Acquire per-channel processing lock to prevent concurrent message processing
+	// This ensures only one message is processed at a time per channel
+	h.channelProcessingMu.Lock()
+	if h.channelProcessing[event.Channel] {
+		h.channelProcessingMu.Unlock()
+		log.Printf("[slack] Channel %s already processing, skipping event", event.Channel)
+		return
+	}
+	h.channelProcessing[event.Channel] = true
+	h.channelProcessingMu.Unlock()
+
+	// Ensure we release the channel lock when done
+	defer func() {
+		h.channelProcessingMu.Lock()
+		delete(h.channelProcessing, event.Channel)
+		h.channelProcessingMu.Unlock()
+	}()
+
 	// Update activity
 	h.activityMu.Lock()
 	h.lastActivity[event.Channel] = time.Now()
@@ -275,70 +393,50 @@ func (h *Handler) processEvent(event *SlackEvent) {
 	// Get user info
 	user := h.getUser(event.User)
 	userName := "Unknown"
+	userEmail := ""
 	if user != nil {
 		userName = user.RealName
 		if userName == "" {
 			userName = user.Name
 		}
+		userEmail = user.Email
 	}
 
-	// Load conversation
-	h.conversationsMu.Lock()
-	messages, ok := h.conversations[event.Channel]
-	if !ok {
-		messages = []conversationMessage{}
-	}
-	h.conversationsMu.Unlock()
+	// Create context with channel info for spawn notifications
+	ctx := context.Background()
+	ctx = notification.WithChannel(ctx, notification.ChannelContext{
+		Type:      notification.ChannelSlack,
+		ChannelID: event.Channel,
+		UserID:    event.User,
+		UserName:  userName,
+		Email:     userEmail,
+	})
 
 	// Resolve agent based on message prefix and channel name
-	ctx := context.Background()
 	channelName := h.getChannelName(event.Channel)
 	agentName, cleanedMessage := h.resolveAgentFromMessage(ctx, channelName, event.Text)
 
-	// Build system prompt
-	agentDef, ok := h.config.Agents[agentName]
-	if !ok {
-		log.Printf("%s agent not found in config", agentName)
+	// Validate message content is not empty
+	cleanedMessage = strings.TrimSpace(cleanedMessage)
+	if cleanedMessage == "" {
+		log.Printf("[slack] Empty message content after cleaning, skipping")
 		return
 	}
 
-	systemPrompt := agentDef.System
-	systemPrompt += fmt.Sprintf("\n\n## Current Context\nChannel: Slack\nUser: %s\n", userName)
-
-	// Load memory
-	memContent, _ := memory.Load(h.baseDir)
-	if memContent != "" {
-		systemPrompt += memory.GetPromptSection(memContent)
+	// Get or create persistent session for this channel
+	proc, err := h.getOrCreateSession(ctx, event.Channel, agentName, userName)
+	if err != nil {
+		log.Printf("Error getting/creating session: %v", err)
+		h.client.SendMessage(event.Channel, "Sorry, I encountered an error processing your message.")
+		return
 	}
 
-	// Add conversation history to system prompt for context
-	if len(messages) > 0 {
-		systemPrompt += "\n\n## Recent Conversation History\n"
-		for _, msg := range messages {
-			if msg.Role == "user" {
-				systemPrompt += fmt.Sprintf("User: %s\n", msg.Content)
-			} else {
-				systemPrompt += fmt.Sprintf("You: %s\n", msg.Content)
-			}
-		}
-		systemPrompt += "\n(Continue the conversation naturally, remembering the context above.)"
-	}
-
-	// Add user message (use cleaned message with prefix stripped)
-	messages = append(messages, conversationMessage{
-		Role:    "user",
-		Content: cleanedMessage,
-	})
-
-	// Keep conversation window (last 20 messages)
-	if len(messages) > 20 {
-		messages = messages[len(messages)-20:]
-	}
-
-	// Process with Claude
-	response, err := h.processWithClaude(ctx, agentName, systemPrompt, messages)
+	// Send message to the persistent process
+	response, err := proc.Send(ctx, cleanedMessage)
 	if err != nil {
 		log.Printf("Error processing Slack message: %v", err)
+		// Mark the session as failed so a new one is created next time
+		proc.Fail(err)
 		h.client.SendMessage(event.Channel, "Sorry, I encountered an error processing your message.")
 		return
 	}
@@ -357,18 +455,43 @@ func (h *Handler) processEvent(event *SlackEvent) {
 		return
 	}
 
-	// Save to conversation history (use cleaned response)
+	// Save to conversation history for synthesis (memory summarization)
+	h.conversationsMu.Lock()
+	messages := h.conversations[event.Channel]
+	messages = append(messages, conversationMessage{
+		Role:    "user",
+		Content: cleanedMessage,
+	})
 	messages = append(messages, conversationMessage{
 		Role:    "assistant",
 		Content: cleanResponse,
 	})
-
-	h.conversationsMu.Lock()
+	// Keep conversation window (last 20 messages)
+	if len(messages) > 20 {
+		messages = messages[len(messages)-20:]
+	}
 	h.conversations[event.Channel] = messages
 	h.conversationsMu.Unlock()
 }
 
 func (h *Handler) processWithClaude(ctx context.Context, agentName string, systemPrompt string, messages []conversationMessage) (string, error) {
+	// Filter out any messages with empty content to prevent API errors
+	filteredMessages := make([]conversationMessage, 0, len(messages))
+	for _, msg := range messages {
+		content := strings.TrimSpace(msg.Content)
+		if content != "" {
+			filteredMessages = append(filteredMessages, conversationMessage{
+				Role:    msg.Role,
+				Content: content,
+			})
+		}
+	}
+	messages = filteredMessages
+
+	if len(messages) == 0 {
+		return "", fmt.Errorf("no valid messages to process")
+	}
+
 	// Get agent definition
 	agentDef, ok := h.config.Agents[agentName]
 	if !ok {
@@ -401,10 +524,18 @@ func (h *Handler) processWithClaude(ctx context.Context, agentName string, syste
 		}
 	}
 
+	if lastUserMessage == "" {
+		return "", fmt.Errorf("no user message found in conversation")
+	}
+
 	response, err := proc.Send(ctx, lastUserMessage)
 	if err != nil {
+		proc.Fail(err)
 		return "", fmt.Errorf("failed to get response: %w", err)
 	}
+
+	// Mark process as completed
+	proc.Complete(response)
 
 	return response, nil
 }
@@ -504,9 +635,13 @@ func (h *Handler) routeWithTron(ctx context.Context, message string) string {
 
 	response, err := proc.Send(ctx, message)
 	if err != nil {
+		proc.Fail(err)
 		log.Printf("Failed to get routing decision from Tron: %v", err)
 		return defaultAgent
 	}
+
+	// Mark router as completed
+	proc.Complete(response)
 
 	// Extract persona name from response
 	match := routerResponsePattern.FindStringSubmatch(response)
@@ -661,9 +796,13 @@ func (h *Handler) synthesizeConversation(channel string) {
 
 	summary, err := proc.Send(ctx, sb.String())
 	if err != nil {
+		proc.Fail(err)
 		log.Printf("Failed to get summary: %v", err)
 		return
 	}
+
+	// Mark summarizer as completed
+	proc.Complete(summary)
 
 	// Append to memory
 	if err := memory.Append(h.baseDir, "Slack conversation", summary); err != nil {
@@ -700,6 +839,23 @@ func (h *Handler) cleanupEventCache() {
 	for eventID, timestamp := range h.processedEvents {
 		if timestamp.Before(cutoff) {
 			delete(h.processedEvents, eventID)
+		}
+	}
+
+	// Also cleanup stale sessions (completed or failed processes)
+	h.cleanupStaleSessions()
+}
+
+// cleanupStaleSessions removes sessions with completed or failed processes
+func (h *Handler) cleanupStaleSessions() {
+	h.sessionsMu.Lock()
+	defer h.sessionsMu.Unlock()
+
+	for channel, proc := range h.sessions {
+		status := proc.Status()
+		if status == vega.StatusCompleted || status == vega.StatusFailed {
+			log.Printf("[slack] Cleaning up stale session for channel %s (status: %v)", channel, status)
+			delete(h.sessions, channel)
 		}
 	}
 }
