@@ -220,11 +220,17 @@ func (h *Handler) getOrCreateSession(ctx context.Context, channel, agentName, us
 		}
 	}
 
+	// Filter tools based on agent's config
+	agentTools := h.tools
+	if len(agentDef.Tools) > 0 && h.tools != nil {
+		agentTools = h.tools.Filter(agentDef.Tools...)
+	}
+
 	agent := vega.Agent{
 		Name:   agentDef.Name,
 		Model:  agentDef.Model,
 		System: vega.StaticPrompt(systemPrompt),
-		Tools:  h.tools,
+		Tools:  agentTools,
 	}
 
 	if agentDef.Temperature != nil {
